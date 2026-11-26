@@ -1,0 +1,42 @@
+{
+  "name": "agent-writer",
+  "version": "0.1.6",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "main": "desktop.mjs",
+  "productName": "Agent Writer",
+  "description": "中文小说创作工作台",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test",
+    "desktop": "electron .",
+    "build:win": "electron-builder --win portable --x64"
+  },
+  "engines": { "node": ">=22" },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "pdfjs-dist": "^5.4.624",
+    "yauzl": "^3.2.0"
+  },
+  "devDependencies": {
+    "electron": "45.5.0",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "com.agentwriter.desktop",
+    "asar": false,
+    "npmRebuild": false,
+    "directories": { "output": "dist" },
+    "files": ["desktop.mjs", "preload.cjs", "desktop-icon.ico", "server.mjs", "lib/**", "public/**", "package.json"],
+    "win": {
+      "icon": "desktop-icon.ico",
+      "signExecutable": false,
+      "target": ["portable"]
+    },
+    "portable": {
+      "artifactName": "Agent Writer ${version}.exe",
+      "requestExecutionLevel": "user"
+    }
+  }
+}

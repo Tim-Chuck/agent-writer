@@ -1,0 +1,9 @@
+node_modules/
+.writer-data/
+dist/
+*.log
+.env
+.env.*
+workspace.json
+workspace.tmp
+vault.key
