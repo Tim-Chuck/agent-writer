@@ -7,6 +7,8 @@ const dates = new Intl.DateTimeFormat('zh-CN', {
 const referenceAccept = '.txt,.text,.md,.markdown,.csv,.tsv,.json,.jsonl,.html,.htm,.xhtml,.xml,.docx,.pdf,.epub,.odt';
 const memoryReasons = { chapter: '章节记忆', weekly: '定期记忆', volume: '定量记忆', manual: '手动记忆' };
 const cardTypes = { character: '角色', prop: '道具', location: '地点', organization: '组织' };
+const memoryCardIcons = { character: 'person', prop: 'box', location: 'pin', organization: 'building' };
+const plotTypes = { event: '事件与因果', state: '状态变化', knowledge: '人物知情', thread: '伏笔与承诺' };
 
 function formatDate(value) {
   const date = new Date(value || NaN);
@@ -73,6 +75,7 @@ export function renderProviders({ presets = [], providers = {}, providerTab, act
                 <option value="responses"${config.protocol === 'responses' ? ' selected' : ''}>OpenAI Responses</option>
                 <option value="messages"${config.protocol === 'messages' ? ' selected' : ''}>Anthropic Messages</option>
               </select></label>
+              <label class="field"><span>上下文窗口（token）</span><input name="contextTokens" type="number" min="4096" max="2000000" step="1" value="${esc(config.contextTokens ?? '')}" placeholder="可选，填供应商公布的数值" aria-describedby="context-window-help"><small id="context-window-help" class="aux-form-help muted">按此数值估算阅读额度，并为生成留出空间。</small></label>
             </div>
           </details>
           <div class="aux-actions">
@@ -130,7 +133,7 @@ function renderMemoryCollection(items, label, labelFor, textFor) {
     <div class="aux-snapshot-excerpts">${excerpts}${items.length > visible.length ? `<p class="muted">还有 ${counts.format(items.length - visible.length)} 项保存在这次记忆中。</p>` : ''}</div></details>`;
 }
 
-function renderMemoryDetail(header, detail) {
+function renderMemoryDetail(header, detail, enabled, model) {
   if (!header) return '';
   const snapshot = detail?.id === header.id ? detail.snapshot : null;
   const reason = (header.reasons ?? []).map(value => memoryReasons[value]).filter(Boolean).join('、');
@@ -147,6 +150,7 @@ function renderMemoryDetail(header, detail) {
   return `<section class="panel aux-snapshot" aria-labelledby="snapshot-title">
     <header class="aux-panel-head"><div><h2 id="snapshot-title">${esc(header.title || '记忆详情')}</h2><p class="muted">${esc([formatDate(header.createdAt), reason, `${counts.format(textLength)} 字`].filter(Boolean).join(' · '))}</p></div></header>
     <div class="aux-snapshot-body">
+      ${renderExtractionStatus(header, enabled, model)}
       ${summary ? `<p class="aux-memory-totals">${esc(summary)}</p>` : ''}
       ${excerpt.length ? `<blockquote>${esc(excerpt.join('\n'))}</blockquote>` : ''}
       ${groups ? `<div class="aux-snapshot-groups">${groups}</div><p class="aux-form-help muted">这里展示每项内容的节选。</p>` : ''}
@@ -154,26 +158,116 @@ function renderMemoryDetail(header, detail) {
   </section>`;
 }
 
-export function renderMemories({ project, memoryId, memoryDetail }) {
-  const settings = project.memorySettings ?? {};
+function renderExtractionStatus(entry, enabled, model, kind = 'cards') {
+  const plot = kind === 'plot';
+  const label = plot ? '提取剧情要点' : '识别设定';
+  const scan = entry?.[plot ? 'plotExtraction' : 'cardExtraction'];
+  if (!scan || scan.status === 'complete') return '';
+  if (scan.status === 'failed') {
+    return `<div class="aux-extraction-status is-error"><p>${esc(scan.error || label + '未完成。')}</p>
+      ${enabled ? `<button type="button" class="btn secondary" data-act="memory-retry" data-kind="${kind}" data-id="${esc(entry.id)}">${plot ? '重试提取' : '重试识别'}</button>` : ''}</div>`;
+  }
+  const status = !enabled ? `${label}已暂停` : model === '' ? '等待连接模型' : scan.total > 0 ?
+    `正在${label}（${scan.completed ?? 0}/${scan.total}）` : `等待${label}`;
+  return `<p class="aux-extraction-status" role="status">${status}</p>`;
+}
+
+function renderPlotPoints({ project, memoryPoints, model }) {
+  const enabled = project.memorySettings?.extractPlot === true;
+  const waiting = project.memories.findLast(entry => entry.plotExtraction?.status === 'pending');
+  const failed = project.memories.find(entry => entry.plotExtraction?.status === 'failed');
+  const chapters = new Map();
+  for (const point of memoryPoints) {
+    if (!chapters.has(point.chapterId)) chapters.set(point.chapterId, []);
+    chapters.get(point.chapterId).push(point);
+  }
+  const entries = [...chapters.values()].map((points, index) => `<details class="aux-snapshot-group"${index === 0 ? ' open' : ''}>
+    <summary><span>${esc(points[0].chapterTitle)}</span><small class="muted">${counts.format(points.length)} 条</small>${icon('chevron', 16)}</summary>
+    <ul class="aux-plot-list">${points.map(point => `<li><small>${esc(plotTypes[point.type])}</small><p>${esc(point.text)}</p>
+      <blockquote>${esc(point.evidence)}</blockquote>
+      <button type="button" class="btn aux-ai-source" data-act="plot-source" data-id="${esc(point.chapterId)}" data-offset="${esc(point.offset)}" data-length="${esc(point.evidence.length)}">${icon('file', 14)}查看正文位置</button></li>`).join('')}</ul>
+    </details>`).join('');
+  return `<section class="panel aux-memory-cards" aria-labelledby="plot-points-title">
+    <header class="aux-panel-head"><div><h2 id="plot-points-title">剧情要点 <small>${counts.format(memoryPoints.length)}</small></h2>
+      <p class="muted">写作时会根据本轮要求查找相关要点和原文。</p></div></header>
+    <div class="aux-ai-content">
+      ${renderExtractionStatus(waiting, enabled, model, 'plot')}${renderExtractionStatus(failed, enabled, model, 'plot')}
+      ${entries ? `<div class="aux-snapshot-groups">${entries}</div>` : emptyState('outline', '还没有可用的剧情要点', enabled
+        ? '写好正文后保存记忆，模型会提取事件、人物知情范围和伏笔。' : '开启「提取剧情要点」后，模型会读取当前稿件并生成有原文依据的要点。')}
+    </div></section>`;
+}
+
+function renderMemoryCards({ project, memoryCards, memoryFilter, model }) {
+  const enabled = project.memorySettings?.extractCards === true;
+  const waiting = project.memories.findLast(entry => entry.cardExtraction?.status === 'pending');
+  const failed = project.memories.find(entry => entry.cardExtraction?.status === 'failed');
+  const cards = memoryFilter === 'all' ? memoryCards : memoryCards.filter(card => card.type === memoryFilter);
+  const filters = Object.entries({ all: '全部', ...cardTypes }).map(([id, label]) =>
+    `<button type="button" class="btn aux-memory-filter" data-act="memory-filter" data-id="${id}" aria-pressed="${id === memoryFilter}">${label}</button>`).join('');
+  const items = cards.map(card => `<article class="aux-ai-card">
+    <div class="aux-ai-kind"><span class="aux-symbol">${icon(memoryCardIcons[card.type])}</span>${cardTypes[card.type]}</div>
+    <h3>${esc(card.title)}</h3>
+    ${card.authored ? '<small class="aux-ai-authored">有同名的作者设定</small>' : ''}
+    <ul>${card.notes.map(note => `<li><p>${esc(note.description)}</p>
+      <button type="button" class="btn aux-ai-source" data-act="memory-select" data-id="${esc(note.memoryId)}" title="${esc(note.evidence)}">来源 · ${esc(note.chapterTitle || '未命名章节')}</button></li>`).join('')}</ul>
+  </article>`).join('');
+  const emptyTitle = memoryCards.length ? '这个分类还没有卡片' : '还没有 AI 设定卡';
+  const emptyMessage = memoryCards.length ? '可以切换分类查看其他卡片。' : enabled ?
+    '保存记忆后，会从正文识别设定并显示在这里。' : '开启自动识别后，下次保存记忆时会生成卡片。';
+  return `<section class="panel aux-memory-cards" aria-labelledby="memory-cards-title">
+    <header class="aux-panel-head"><div><h2 id="memory-cards-title">AI 设定卡 <small>${counts.format(memoryCards.length)}</small></h2>
+      <p class="muted">从正文识别设定，单独保存在记忆中。</p></div></header>
+    <div class="aux-ai-content">
+      ${renderExtractionStatus(waiting, enabled, model)}
+      ${renderExtractionStatus(failed, enabled, model)}
+      <div class="aux-memory-filters" role="group" aria-label="按设定类型筛选">${filters}</div>
+      ${cards.length ? `<div class="aux-ai-grid">${items}</div>` : emptyState('layers', emptyTitle, emptyMessage)}
+    </div>
+  </section>`;
+}
+
+export function renderMemoryContent(view) {
+  if (view.memoryTab === 'cards') return renderMemoryCards(view);
+  if (view.memoryTab === 'plot') return renderPlotPoints(view);
+  const { project, memoryId, memoryDetail } = view;
   const entries = project.memories ?? [];
   const selected = entries.find(({ id }) => id === memoryId);
+  const rows = entries.map(({ id, title, createdAt, chapterId, cardExtraction }) => {
+    const analysis = cardExtraction?.status === 'complete' ? (cardExtraction.count ? `识别 ${cardExtraction.count} 条设定` : '无新增设定') :
+      cardExtraction?.status === 'failed' ? '设定识别未完成' : cardExtraction ? '待识别设定' : '';
+    return `<li><button type="button" class="aux-memory-row${selected?.id === id ? ' is-active' : ''}" data-act="memory-select" data-id="${esc(id)}" aria-pressed="${selected?.id === id}">
+      <span class="aux-symbol">${icon(chapterId ? 'file' : 'brain')}</span><span class="aux-row-label"><strong>${esc(title || '记忆')}</strong><small>${esc([formatDate(createdAt), analysis].filter(Boolean).join(' · '))}</small></span>${icon('chevron')}
+    </button></li>`;
+  }).join('');
+  return `<section class="panel aux-memory-list" aria-labelledby="memory-list-title">
+    <div class="aux-panel-head"><h2 id="memory-list-title">保存记录 <small>${counts.format(entries.length)}</small></h2></div>
+    ${entries.length ? `<ul>${rows}</ul>` : emptyState('brain', '还没有保存记录', '可以立即存一份，或者等下次开启新章节时自动保存。')}
+    </section>${renderMemoryDetail(selected, memoryDetail, project.memorySettings?.extractCards === true, view.model)}`;
+}
+
+export function renderMemories(view) {
+  const { project, memoryTab, model } = view;
+  const settings = project.memorySettings ?? {};
   const changes = Number(project.memoryState?.changedCharacters) || 0;
-  const rows = entries.map(({ id, title, createdAt, chapterId }) => `<li><button type="button" class="aux-memory-row${selected?.id === id ? ' is-active' : ''}" data-act="memory-select" data-id="${esc(id)}" aria-pressed="${selected?.id === id}">
-    <span class="aux-symbol">${icon(chapterId ? 'file' : 'brain')}</span><span class="aux-row-label"><strong>${esc(title || '记忆')}</strong><small>${esc(formatDate(createdAt))}</small></span>${icon('chevron')}
-  </button></li>`).join('');
+  const tabs = [['history', '保存记录'], ['plot', '剧情要点'], ['cards', 'AI 设定卡']].map(([id, label]) =>
+    `<button type="button" class="btn" data-act="memory-tab" data-id="${id}" aria-pressed="${memoryTab === id}">${label}</button>`).join('');
 
   return `<section class="page aux-page aux-memories" aria-labelledby="memories-title">
     <header class="page-head aux-head"><div><h1 id="memories-title">记忆</h1><p class="muted">保存项目在不同创作阶段的正文、设定、规划、大纲和资料。</p></div>
       <button type="button" class="btn primary" data-act="memory-save">${icon('plus')}保存当前记忆</button></header>
+    <div class="aux-memory-tabs"><div role="group" aria-label="记忆视图">${tabs}</div></div>
     <div class="aux-memory-layout">
-      <div class="aux-memory-history">
-        <section class="panel aux-memory-list" aria-labelledby="memory-list-title">
-          <div class="aux-panel-head"><h2 id="memory-list-title">保存记录 <small>${counts.format(entries.length)}</small></h2></div>
-          ${entries.length ? `<ul>${rows}</ul>` : emptyState('brain', '还没有保存记录', '可以立即存一份，或者等下次开启新章节时自动保存。')}
-        </section>
-        ${renderMemoryDetail(selected, memoryDetail)}
-      </div>
+      <div class="aux-memory-history" id="memory-content">${renderMemoryContent(view)}</div>
+      <div class="aux-memory-side">
+      <section class="panel aux-memory-settings" aria-labelledby="memory-extraction-title">
+        <div class="aux-panel-head"><h2 id="memory-extraction-title">自动提取</h2>${icon('sparkles')}</div>
+        <div class="aux-memory-form">
+          <label class="aux-setting"><span><strong>保存记忆时识别</strong><small>由当前模型识别正文中的角色、道具、地点和组织。</small></span><input type="checkbox" id="memory-extraction-toggle"${settings.extractCards === true ? ' checked' : ''}></label>
+          <label class="aux-setting"><span><strong>提取剧情要点</strong><small>开启时读取现有正文，之后只提取新增或改动的章节。</small></span><input type="checkbox" id="memory-plot-toggle"${settings.extractPlot === true ? ' checked' : ''}></label>
+          ${model ? `<p class="aux-form-help muted" title="${esc(model)}">当前模型 · ${esc(model)}</p>` :
+            '<button type="button" class="btn secondary" data-act="navigate" data-id="providers">连接模型</button>'}
+        </div>
+      </section>
       <section class="panel aux-memory-settings" aria-labelledby="memory-settings-title">
         <div class="aux-panel-head"><div><h2 id="memory-settings-title">自动保存</h2><p class="muted">按当前项目的创作节奏设置。</p></div>${icon('gear')}</div>
         <form id="memory-form" class="aux-memory-form">
@@ -185,12 +279,13 @@ export function renderMemories({ project, memoryId, memoryDetail }) {
             <label class="aux-number"><span>每</span><input name="intervalDays" type="number" min="1" max="365" required value="${esc(settings.intervalDays ?? 7)}" aria-label="自动保存间隔天数"><span>天保存一次</span></label>
           </fieldset>
           <fieldset><legend class="aux-visually-hidden">定量存储</legend>
-            <label class="aux-setting"><span><strong>定量存储</strong><small>按累计文本改动量保存，当前累计 ${counts.format(changes)} 字。</small></span><input name="volumeEnabled" type="checkbox"${settings.volumeEnabled ? ' checked' : ''}></label>
+            <label class="aux-setting"><span><strong>定量存储</strong><small>按累计文本改动量保存，当前累计 <span id="memory-change-count">${counts.format(changes)}</span> 字。</small></span><input name="volumeEnabled" type="checkbox"${settings.volumeEnabled ? ' checked' : ''}></label>
             <label class="aux-number"><span>累计</span><input name="characterThreshold" type="number" min="1" max="1000000" required value="${esc(settings.characterThreshold ?? 5000)}" aria-label="自动保存累计文本改动量"><span>字改动后保存</span></label>
           </fieldset>
           <button class="btn primary" type="submit">保存设置</button>
         </form>
       </section>
+      </div>
     </div>
   </section>`;
 }

@@ -1,4 +1,5 @@
 const paths = {
+  paperclip: '<path d="M21 11.5l-8.5 8.5a5 5 0 0 1-7.1-7.1l9-9a3.5 3.5 0 0 1 5 5l-9 9a2 2 0 0 1-2.8-2.8l8.4-8.4"/>',
   nib: '<path d="m13 3 8 8-6 6-4 1-8 3 3-8 1-4z"/><path d="m3 21 7-7m3-11 8 8"/><circle cx="11.5" cy="12.5" r="1.7"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   book: '<path d="M12 6C9 4 6 4 3 5v14c3-1 6-1 9 1 3-2 6-2 9-1V5c-3-1-6-1-9 1zm0 0v14"/>',
@@ -23,6 +24,7 @@ const paths = {
   link: '<path d="M14 4h6v6m0-6-9 9m6 0v6H5V7h6"/>',
   eye: '<path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2"/>',
   upload: '<path d="M12 16V4m-4 4 4-4 4 4M4 16v4h16v-4"/>',
+  download: '<path d="M12 4v12m-4-4 4 4 4-4M4 17v3h16v-3"/>',
   trash: '<path d="M4 7h16m-13 0 1 13h8l1-13M9 7V4h6v3m-5 4v5m4-5v5"/>',
   warning: '<path d="M12 3 2 20h20zM12 9v4m0 3h.01"/>',
   menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',

@@ -1,10 +1,11 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, protocol, session, shell } from 'electron';
 import { randomBytes } from 'node:crypto';
-import { access, copyFile, mkdir, mkdtemp, open, rename, rm, rmdir } from 'node:fs/promises';
+import { access, copyFile, mkdir, mkdtemp, open, rename, rm, rmdir, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ARTICLE_EXTENSIONS, extractArticle } from './lib/articles.mjs';
-import { MAX_REFERENCE_BYTES } from './lib/imports.mjs';
+import { MAX_REFERENCE_BYTES, REFERENCE_EXTENSIONS } from './lib/imports.mjs';
+import { txtFilename } from './lib/txt-export.mjs';
 import { startWriterServer } from './server.mjs';
 
 const scheme = 'agent-writer';
@@ -19,7 +20,7 @@ app.setAppUserModelId('com.agentwriter.desktop');
 
 let window;
 let backend;
-let pickingArticle = false;
+let pickingFile = false;
 
 async function exists(path) {
   try {
@@ -61,15 +62,15 @@ function openExternal(url) {
   if (new URL(url).protocol === 'https:') void shell.openExternal(url).catch(() => {});
 }
 
-async function previewArticleFile(path) {
+async function readImportFile(path) {
   const name = basename(path);
   let bytes;
   try {
     const file = await open(path, 'r');
     try {
       const info = await file.stat();
-      if (!info.isFile()) return { name, error: '请选择一个文章文件。' };
-      if (info.size > MAX_REFERENCE_BYTES) return { name, error: '单个文章文件不能超过 25 MB。' };
+      if (!info.isFile()) return { name, error: '请选择一个文件。' };
+      if (info.size > MAX_REFERENCE_BYTES) return { name, error: '单个文件不能超过 25 MB。' };
       bytes = Buffer.concat(await file.createReadStream({ autoClose: false, end: MAX_REFERENCE_BYTES }).toArray());
     } finally {
       await file.close();
@@ -77,6 +78,13 @@ async function previewArticleFile(path) {
   } catch {
     return { name, error: '无法读取此文件，请检查文件是否仍可访问。' };
   }
+  if (bytes.length > MAX_REFERENCE_BYTES) return { name, error: '单个文件不能超过 25 MB。' };
+  return { name, bytes };
+}
+
+async function previewArticleFile(path) {
+  const { name, bytes, error } = await readImportFile(path);
+  if (error) return { name, error };
   try {
     return { name, preview: await extractArticle(name, bytes) };
   } catch (error) {
@@ -84,26 +92,62 @@ async function previewArticleFile(path) {
   }
 }
 
-async function pickArticle(event) {
+function workspaceWindow(event) {
   const owner = window;
   const frame = event.senderFrame;
   if (!owner || event.sender !== owner.webContents || !frame ||
       frame !== event.sender.mainFrame || !frame.url.startsWith(`${workspaceOrigin}/`)) {
-    throw new Error('无法从当前页面选择文章文件。');
+    throw new Error('无法从当前页面访问桌面窗口。');
   }
-  if (pickingArticle) return null;
-  pickingArticle = true;
+  return owner;
+}
+
+async function pickImportFile(event, purpose = 'article', preview = false) {
+  const owner = workspaceWindow(event);
+  const titles = { article: '选择要导入的文章', reference: '选择要导入的参考资料', attachment: '选择对话附件' };
+  if (!Object.hasOwn(titles, purpose)) throw new Error('文件类型无效。');
+  if (pickingFile) return null;
+  pickingFile = true;
+  const article = purpose === 'article';
   try {
     const { canceled, filePaths } = await dialog.showOpenDialog(owner, {
-      title: '选择要导入的文章',
+      title: titles[purpose],
       properties: ['openFile'],
-      filters: [{ name: '文章文件', extensions: [...ARTICLE_EXTENSIONS] }],
+      filters: [{ name: article ? '文章文件' : '文字资料', extensions: [...(article ? ARTICLE_EXTENSIONS : REFERENCE_EXTENSIONS)] }],
     });
-    return canceled || !filePaths[0] ? null : await previewArticleFile(filePaths[0]);
+    if (canceled || !filePaths[0]) return null;
+    if (preview) return await previewArticleFile(filePaths[0]);
+    const { name, bytes, error } = await readImportFile(filePaths[0]);
+    return error ? { error } : { name, data: bytes.toString('base64') };
   } catch {
     return { error: '无法打开文件选择窗口，请重试。' };
   } finally {
-    pickingArticle = false;
+    pickingFile = false;
+  }
+}
+
+async function saveTxt(event, filename, text) {
+  const owner = workspaceWindow(event);
+  if (typeof filename !== 'string' || typeof text !== 'string') return { error: '导出内容无效，请重试。' };
+  try {
+    const { canceled, filePath } = await dialog.showSaveDialog(owner, {
+      title: '导出 TXT',
+      defaultPath: txtFilename(filename),
+      filters: [{ name: '纯文本', extensions: ['txt'] }],
+    });
+    if (canceled || !filePath) return { saved: false };
+    const temporary = await mkdtemp(join(dirname(filePath), '.agent-writer-export-'));
+    const staged = join(temporary, 'export.txt');
+    try {
+      await writeFile(staged, text, 'utf8');
+      await rename(staged, filePath);
+    } finally {
+      await rm(staged, { force: true }).catch(() => {});
+      await rmdir(temporary).catch(() => {});
+    }
+    return { saved: true };
+  } catch {
+    return { error: '无法保存 TXT，请检查目标文件夹是否可写。' };
   }
 }
 
@@ -186,7 +230,9 @@ if (!app.requestSingleInstanceLock()) {
     const token = randomBytes(32).toString('hex');
     backend = await startWriterServer({ port: 0, directory: await workspaceDirectory(), token });
     registerWorkspace(backend.origin, token);
-    ipcMain.handle('article:pick', pickArticle);
+    ipcMain.handle('article:pick', event => pickImportFile(event, 'article', true));
+    ipcMain.handle('agent:pick-file', (event, purpose) => pickImportFile(event, purpose));
+    ipcMain.handle('export:save-txt', saveTxt);
     await openWindow();
   }).catch(error => {
     dialog.showErrorBox('Agent Writer 启动失败', `无法打开本地工作区。\n${error.code || error.message}`);

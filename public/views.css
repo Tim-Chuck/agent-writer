@@ -179,6 +179,11 @@
   color: var(--aux-accent);
 }
 .aux-symbol svg { width: 18px; height: 18px; }
+.aux-page .aux-plot-list { display: grid; gap: 12px; padding: 0 14px 12px; list-style: none; }
+.aux-plot-list li { border-top: 1px solid var(--aux-line); padding-top: 10px; overflow-wrap: anywhere; }
+.aux-plot-list li > small { color: var(--aux-muted); }
+.aux-plot-list p { margin: 3px 0; }
+.aux-plot-list blockquote { margin: 6px 0; padding: 6px 8px; background: var(--aux-soft); color: var(--aux-muted); border-radius: 6px; }
 .aux-drop .aux-drop-symbol { width: 46px; height: 46px; border-radius: 11px; }
 .aux-drop-symbol svg { width: 23px; height: 23px; }
 .aux-file-input, .aux-visually-hidden {
@@ -238,7 +243,33 @@
 .aux-empty p { max-width: 29em; margin: 0; color: var(--aux-muted); font-size: 13px; line-height: 1.6; }
 
 .aux-memory-layout { grid-template-columns: minmax(0, 1.6fr) minmax(266px, 1fr); }
-.aux-memory-history { display: grid; gap: 18px; min-width: 0; }
+.aux-memory-history, .aux-memory-side { display: grid; gap: 18px; min-width: 0; }
+.aux-memory-tabs { display: flex; align-items: center; gap: 16px; margin-bottom: 22px; }
+.aux-memory-tabs::after { content: ''; flex: 1; border-top: 1px solid var(--aux-line); }
+.aux-memory-tabs > div { display: inline-flex; padding: 3px; gap: 3px; border: 1px solid var(--aux-line); border-radius: 9px; background: var(--aux-soft); }
+.aux-memory-tabs .btn { min-height: 31px; padding: 4px 14px; border-radius: 6px; }
+.aux-memory-tabs .btn:hover, .aux-memory-filter:hover { color: var(--blue-dark); }
+.aux-memory-tabs .btn[aria-pressed="true"], .aux-memory-filter[aria-pressed="true"] { color: var(--blue-dark); background: var(--aux-tint); }
+.aux-memory-cards .aux-panel-head { border-bottom: 0; padding-bottom: 12px; }
+.aux-ai-content { display: grid; gap: 15px; padding: 0 20px 20px; }
+.aux-memory-filters { display: flex; flex-wrap: wrap; gap: 4px; }
+.aux-memory-filter { min-height: 32px; padding: 4px 12px; font-size: 13px; }
+.aux-ai-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
+.aux-ai-card { min-width: 0; padding: 14px 15px; border: 1px solid var(--aux-line); border-radius: 9px; overflow-wrap: anywhere; }
+.aux-ai-kind { display: flex; align-items: center; gap: 8px; color: var(--aux-muted); font-size: 13px; }
+.aux-ai-kind .aux-symbol { width: 29px; height: 29px; }
+.aux-ai-kind svg { width: 16px; height: 16px; }
+.aux-ai-card h3 { margin-top: 8px; font-size: 16px; line-height: 1.45; }
+.aux-ai-authored { display: block; margin-top: 3px; color: var(--aux-muted); font-size: 12px; }
+.aux-ai-card p { margin-top: 7px; font-size: 13px; line-height: 1.65; }
+.aux-ai-card li + li { border-top: 1px solid var(--aux-line); }
+.aux-page .aux-ai-source { display: block; max-width: 100%; min-height: 28px; padding: 3px 0; color: var(--aux-muted); text-align: left; text-overflow: ellipsis; overflow: hidden; font-size: 12px; }
+.aux-ai-source:hover { color: var(--blue-dark); text-decoration: underline; }
+.aux-extraction-status { color: var(--aux-muted); font-size: 13px; line-height: 1.55; }
+.aux-extraction-status.is-error { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; color: var(--danger); }
+.aux-extraction-status .btn { min-height: 30px; padding: 4px 9px; }
+.aux-snapshot-body .aux-extraction-status { margin-bottom: 9px; }
+.aux-memory-side .aux-form-help { overflow-wrap: anywhere; }
 .aux-memory-list li { margin: 0 9px; padding: 4px 0; }
 .aux-memory-list li > button > svg { flex: 0 0 auto; color: var(--aux-muted); width: 16px; height: 16px; transform: rotate(-90deg); }
 .aux-memory-settings .aux-panel-head > svg { color: var(--aux-muted); width: 17px; height: 17px; }
@@ -292,5 +323,7 @@
   .aux-drop-symbol svg { width: 19px; height: 19px; }
   .aux-advanced-fields { grid-template-columns: 1fr; }
   .aux-reference-preview pre { padding-inline: 16px; }
+  .aux-ai-grid { grid-template-columns: minmax(0, 1fr); }
+  .aux-ai-content { padding-inline: 16px; }
 }
 .aux-providers #provider-status[data-error="true"] { color: var(--danger); }

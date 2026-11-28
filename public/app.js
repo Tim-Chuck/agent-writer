@@ -1,7 +1,7 @@
 import { esc, icon } from './icons.js';
-import { chapterNumber, contextItems, countWords, emptyWorkspace, sidebar, writer } from './workspace.js';
+import { chapterNumber, composerAttachments, contextItems, countWords, emptyWorkspace, maxChatAttachments, sidebar, writer } from './workspace.js';
 import { renderCards, renderOutline } from './outline.js';
-import { renderMemories, renderProviders, renderReferences } from './views.js';
+import { renderMemories, renderMemoryContent, renderProviders, renderReferences } from './views.js';
 
 const app = document.getElementById('app');
 const dialog = document.getElementById('dialog');
@@ -9,12 +9,17 @@ dialog.setAttribute('aria-labelledby', 'modal-title');
 const toast = document.getElementById('toast');
 const pages = { write: '写作台', outline: '故事大纲', cards: '设定卡片', references: '参考资料', memories: '记忆', providers: 'API 设置' };
 const defaultSelection = { chapters: true, cards: true, scenes: true, planning: true };
+const maxFileBytes = 25 * 1024 * 1024;
+const articleDrops = new WeakMap();
 const ui = {
   view: Object.hasOwn(pages, location.hash.slice(1)) ? location.hash.slice(1) : 'write',
   chapterId: '', referenceId: '', memoryId: '', memoryDetail: null,
-  cardType: 'all', outlineFilter: '', providerTab: '', assistantTab: 'sources',
+  memoryTab: 'history', memoryFilter: 'all', memoryCards: [], memoryPoints: [],
+  cardType: 'all', outlineFilter: '', providerTab: '', assistantTab: '',
   expanded: new Set(), sourcesInfo: false, mobileNav: false, mobileAssistant: false,
-  drafts: new Map(), entries: new Map(), generating: new Set(), mode: 'write', saved: '已保存',
+  drafts: new Map(), entries: new Map(), agentRuns: new Map(), mode: 'write', saved: '已保存',
+  draftAttachments: new Map(), readingAttachments: new Set(),
+  historyErrors: new Map(),
 };
 let state;
 let toastTimer;
@@ -23,7 +28,10 @@ let saveQueue = Promise.resolve();
 let saving = 0;
 let dialogAction;
 let drag;
+let memoryRequest = 0;
+let memoryRefreshedAt = 0;
 const pending = new Map();
+const historyRequests = new Map();
 
 async function api(path, method = 'GET', payload) {
   const response = await fetch(path, {
@@ -39,10 +47,18 @@ async function api(path, method = 'GET', payload) {
 }
 
 const project = () => state.projects.find(item => item.id === state.activeProjectId) || state.projects[0];
-const chapter = (book = project()) => book?.chapters.find(item => item.id === ui.chapterId) || book?.chapters[0];
-const threadKey = () => `${project().id}/${chapter().id}`;
+const chapter = (book = project()) => book?.chapters.find(item => item.id === ui.chapterId) ||
+  book?.chapters.find(item => item.id === book.activeChapterId) || book?.chapters[0];
+const projectKey = () => project()?.id || 'workspace';
+const threadKey = () => `${projectKey()}/${chapter()?.id || ''}`;
 const urlFor = (id, path = '') => `/api/projects/${id}${path}`;
 const storageKey = suffix => `agent-writer/${project().id}/${suffix}`;
+const readingDepth = () => project() ? localRead(storageKey('reading-depth'), 'standard') : 'standard';
+const memoryModel = () => state.providers[state.activeProviderId]?.model || '';
+const memoryView = () => ({
+  project: project(), model: memoryModel(), memoryId: ui.memoryId, memoryDetail: ui.memoryDetail,
+  memoryTab: ui.memoryTab, memoryFilter: ui.memoryFilter, memoryCards: ui.memoryCards, memoryPoints: ui.memoryPoints,
+});
 
 function localRead(key, fallback) {
   try { return JSON.parse(localStorage.getItem(key)) ?? fallback; }
@@ -71,12 +87,33 @@ function describeSave(status) {
   if (target) target.textContent = status;
 }
 
+function loadConversation(key, refresh = false) {
+  if (!refresh && ui.entries.has(key)) return Promise.resolve(ui.entries.get(key));
+  if (historyRequests.has(key)) return historyRequests.get(key);
+  const split = key.indexOf('/');
+  const origin = key.slice(0, split);
+  const path = origin === 'workspace' ? '/api/agent/conversation'
+    : urlFor(origin, '/conversation/' + encodeURIComponent(key.slice(split + 1)));
+  ui.historyErrors.delete(key);
+  const request = api(path).then(({ entries }) => {
+    ui.entries.set(key, entries);
+    return entries;
+  }).catch(error => {
+    ui.historyErrors.set(key, error.message);
+    throw error;
+  }).finally(() => historyRequests.delete(key));
+  historyRequests.set(key, request);
+  return request;
+}
+
 function render({ keepScroll = true } = {}) {
   const previous = keepScroll ? app.querySelector('.manuscript-scroll')?.scrollTop || 0 : 0;
+  const chapterScroll = keepScroll ? app.querySelector('.chapter-list')?.scrollTop || 0 : 0;
   const p = project();
   const c = chapter(p);
   const shell = sidebar({ state, project: p, chapter: c, view: ui.view, mobileNav: ui.mobileNav });
   let content;
+  let assistantTab;
   switch (ui.view) {
     case 'outline':
       content = renderOutline({ project: p, cardType: ui.cardType, outlineFilter: ui.outlineFilter });
@@ -88,21 +125,33 @@ function render({ keepScroll = true } = {}) {
       content = renderReferences({ project: p, referenceId: ui.referenceId });
       break;
     case 'memories':
-      content = renderMemories({ project: p, memoryId: ui.memoryId, memoryDetail: ui.memoryDetail });
+      content = renderMemories(memoryView());
       break;
     case 'providers':
       content = renderProviders({ ...state, providerTab: ui.providerTab || state.activeProviderId || 'openai' });
       break;
     default:
+      const job = ui.agentRuns.get(projectKey());
+      const key = job?.key || threadKey();
+      if (!ui.entries.has(key) && !historyRequests.has(key) && !ui.historyErrors.has(key)) {
+        loadConversation(key).catch(() => {}).finally(() => {
+          if (ui.view === 'write' && threadKey() === key) render();
+        });
+      }
+      const entries = ui.entries.get(key) || [];
+      assistantTab = ui.assistantTab || (entries.length || ui.historyErrors.has(key) ? 'conversation' : 'sources');
+      const assistant = {
+        ...ui, state, entries, prompt: ui.drafts.get(key) || '', tab: assistantTab,
+        attachments: ui.draftAttachments.get(key) || [], attachmentLoading: ui.readingAttachments.has(key),
+        busy: Boolean(job?.busy), locked: Boolean(job),
+        historyLoading: !ui.entries.has(key) && historyRequests.has(key), historyError: ui.historyErrors.get(key),
+      };
       if (p) {
-        const key = threadKey();
         content = writer({
-          ...ui, project: p, chapter: c, state, tab: ui.assistantTab, selection: selection(),
-          entries: ui.entries.get(key) || [], prompt: ui.drafts.get(key) || '',
-          busy: ui.generating.has(key),
+          ...assistant, project: p, chapter: c, selection: selection(), depth: readingDepth(),
         });
       } else {
-        content = emptyWorkspace();
+        content = emptyWorkspace(assistant);
       }
   }
   const mobileTitle = !p && ui.view === 'write' ? '工作区' : pages[ui.view];
@@ -110,9 +159,11 @@ function render({ keepScroll = true } = {}) {
   app.querySelectorAll('input[data-mixed="true"]').forEach(el => { el.indeterminate = true; });
   const scroll = app.querySelector('.manuscript-scroll');
   if (scroll) scroll.scrollTop = previous;
+  const chapters = app.querySelector('.chapter-list');
+  if (chapters) chapters.scrollTop = chapterScroll;
   fitManuscript();
   const conversation = document.getElementById('assistant-scroll');
-  if (ui.assistantTab === 'conversation' && conversation) conversation.scrollTop = conversation.scrollHeight;
+  if ((assistantTab === 'conversation' || !p) && conversation) conversation.scrollTop = conversation.scrollHeight;
 }
 
 function fitManuscript() {
@@ -137,12 +188,40 @@ function navigate(view, keepScroll = false) {
 async function refreshMemories() {
   const current = project();
   if (!current) return;
+  const request = ++memoryRequest;
+  memoryRefreshedAt = Date.now();
   const result = await api(urlFor(current.id, '/memories'));
-  const changed = current.memories[0]?.id !== result.memories[0]?.id;
-  current.memories = result.memories;
-  current.memoryState = result.memoryState;
-  if (changed && ui.view === 'memories' && project()?.id === current.id &&
-      !document.activeElement?.closest('#memory-form')) render();
+  if (request !== memoryRequest || project()?.id !== current.id || ui.view !== 'memories') return;
+  const changed = JSON.stringify([current.memories, ui.memoryCards, ui.memoryPoints]) !== JSON.stringify([result.memories, result.cards, result.points]);
+  mergeBook(current, result);
+  ui.memoryCards = result.cards;
+  ui.memoryPoints = result.points;
+  if (changed) updateMemoryContent();
+}
+
+function updateMemoryContent() {
+  const pane = document.getElementById('memory-content');
+  if (!pane) return;
+  const active = document.activeElement;
+  const focus = pane.contains(active) && active.dataset?.act ? active.dataset : null;
+  const expanded = [...pane.querySelectorAll('.aux-snapshot-group')].map(group => group.open);
+  pane.innerHTML = renderMemoryContent(memoryView());
+  pane.querySelectorAll('.aux-snapshot-group').forEach((group, i) => { if (expanded[i]) group.open = true; });
+  if (focus) {
+    const action = CSS.escape(focus.act);
+    const id = CSS.escape(focus.id || '');
+    pane.querySelector(`[data-act="${action}"][data-id="${id}"]`)?.focus({ preventScroll: true });
+  }
+  const changeCount = document.getElementById('memory-change-count');
+  if (changeCount) changeCount.textContent = (Number(project().memoryState?.changedCharacters) || 0).toLocaleString('zh-CN');
+}
+
+function setMemoryTab(tab) {
+  ui.memoryTab = tab;
+  app.querySelectorAll('[data-act="memory-tab"]').forEach(button => {
+    button.setAttribute('aria-pressed', String(button.dataset.id === tab));
+  });
+  updateMemoryContent();
 }
 
 function stage(part, id = project().id) {
@@ -155,7 +234,7 @@ function stage(part, id = project().id) {
 function mergeBook(target, incoming) {
   target.memories = incoming.memories;
   target.memoryState = incoming.memoryState;
-  target.updatedAt = incoming.updatedAt;
+  if (incoming.updatedAt) target.updatedAt = incoming.updatedAt;
 }
 
 function flush() {
@@ -193,13 +272,18 @@ async function patchBook(target, patch) {
 
 function resetProject() {
   const current = project();
-  ui.chapterId = current ? localRead(storageKey('chapter'), current.activeChapterId || current.defaultChapterId || current.chapters[0].id) : '';
+  ui.chapterId = current ? localRead(storageKey('chapter'), current.activeChapterId || current.defaultChapterId || '') : '';
+  ui.chapterId = chapter(current)?.id || '';
   if (!current && ui.view !== 'providers') ui.view = 'write';
   ui.referenceId = '';
   ui.memoryId = '';
   ui.memoryDetail = null;
+  ui.memoryTab = 'history';
+  ui.memoryFilter = 'all';
+  ui.memoryCards = [];
+  ui.memoryPoints = [];
   ui.outlineFilter = '';
-  ui.assistantTab = 'sources';
+  ui.assistantTab = '';
   ui.expanded.clear();
   describeSave('已保存');
 }
@@ -231,10 +315,9 @@ function articleImportDialog() {
   const target = project();
   const destinationField = target ? `<label class="field"><span>导入到</span><select name="articleDestination"><option value="current">追加到「${esc(target.title)}」</option><option value="new">新建项目</option></select></label>` : '';
   const desktopPicker = window.agentWriter?.pickArticle;
-  const filePicker = desktopPicker ?
-    `<div class="article-file-control"><button class="btn secondary" type="button" aria-describedby="article-file-help">${icon('upload')}选择文件</button><span class="article-filename muted" aria-live="polite">未选择任何文件</span></div>` :
-    '<input id="article-file" name="articleFile" type="file" accept=".txt,.text,.md,.markdown,.docx,.odt,.pdf,.epub,.html,.htm,.xhtml" aria-describedby="article-file-help">';
-  const fileField = `<div class="field article-file">${desktopPicker ? '<span>文章文件</span>' : '<label for="article-file">文章文件</label>'}${filePicker}<small id="article-file-help" class="muted">TXT、Markdown、Word、ODT、EPUB、HTML 或文字版 PDF，最多 25 MB。</small></div>`;
+  const filePicker = desktopPicker ? `<button class="btn secondary" type="button" aria-describedby="article-file-help">${icon('upload')}选择文件</button>` :
+    `<input id="article-file" class="aux-file-input" name="articleFile" type="file" accept=".txt,.text,.md,.markdown,.docx,.odt,.pdf,.epub,.html,.htm,.xhtml" aria-describedby="article-file-help"><label class="btn secondary" for="article-file">${icon('upload')}选择文件</label>`;
+  const fileField = `<div class="field article-file"><span>文章文件</span><div class="article-file-control" data-drop="article">${filePicker}<span class="article-filename muted" aria-live="polite">或拖入一篇文章</span></div><small id="article-file-help" class="muted">TXT、Markdown、Word、ODT、EPUB、HTML 或文字版 PDF，最多 25 MB。</small></div>`;
   let preview;
   const selectedChapters = mode => mode === 'single' ? [{ title: preview.title, text: preview.text }] : preview.chapters;
   showDialog('导入文章', fileField + destinationField +
@@ -327,13 +410,14 @@ function articleImportDialog() {
       if (isCurrent()) submit.disabled = !preview;
     }
   }
+  const loadArticle = file => loadPreview(async () => ({ name: file.name,
+    preview: await api('/api/articles/preview', 'POST', await packLocalFile(file)),
+  }), '正在读取并识别章节…');
+  articleDrops.set(form.querySelector('[data-drop="article"]'), loadArticle);
   fileControl?.addEventListener('change', () => {
     const file = fileControl.files[0];
-    if (!file) return;
-    void loadPreview(async () => {
-      if (file.size > 25 * 1024 * 1024) throw new Error('单个文章文件不能超过 25 MB。');
-      return { preview: await api('/api/articles/preview', 'POST', { name: file.name, data: await fileData(file) }) };
-    }, '正在读取并识别章节…');
+    fileControl.value = '';
+    if (file) void loadArticle(file);
   });
   pickButton?.addEventListener('click', async () => {
     if (preview && submit.disabled) return;
@@ -344,17 +428,35 @@ function articleImportDialog() {
   });
 }
 
+function renameProjectDialog(id) {
+  const book = state.projects.find(item => item.id === id);
+  if (!book) return;
+  showDialog('重命名项目', modalField('title', '作品名称', book.title, false, 120, true), '保存名称', async ({ title }) => {
+    const nextTitle = title.trim();
+    if (!nextTitle) throw new Error('请填写作品名称。');
+    if (nextTitle !== book.title) {
+      await patchBook(book, { title: nextTitle });
+      render();
+      notify('已重命名项目');
+    }
+    return app.querySelector('.project-rename');
+  });
+  const input = dialog.querySelector('input[name="title"]');
+  input.focus();
+  input.select();
+}
+
 function deleteProjectDialog(id) {
   const book = state.projects.find(item => item.id === id);
   if (!book) return;
   showDialog('删除项目',
-    `<p class="modal-note">确定删除「${esc(book.title)}」吗？正文、设定、参考资料和记忆会一起删除。此操作无法撤销。</p>`,
+    `<p class="modal-note">确定删除「${esc(book.title)}」吗？正文、设定、参考资料、记忆和对话记录会一起删除。此操作无法撤销。</p>`,
     '确认删除', async () => {
       await flush();
       const result = await api(urlFor(book.id), 'DELETE');
       state.projects = state.projects.filter(item => item.id !== book.id);
       state.activeProjectId = result.activeProjectId;
-      for (const threads of [ui.drafts, ui.entries, ui.generating]) {
+      for (const threads of [ui.drafts, ui.entries, ui.draftAttachments, ui.historyErrors]) {
         for (const key of threads.keys()) {
           if (key.startsWith(book.id + '/')) threads.delete(key);
         }
@@ -362,6 +464,7 @@ function deleteProjectDialog(id) {
       try {
         localStorage.removeItem(`agent-writer/${book.id}/chapter`);
         localStorage.removeItem(`agent-writer/${book.id}/reading`);
+        localStorage.removeItem(`agent-writer/${book.id}/reading-depth`);
       } catch { /* Local UI preferences may be unavailable. */ }
       resetProject();
       navigate('write');
@@ -381,6 +484,94 @@ function chapterDialog() {
     document.getElementById('chapter-text')?.focus();
     notify(p.memorySettings.chapterEnabled ? '已创建章节并检查章节记忆' : '已创建章节');
   });
+}
+
+async function exportTxt(projectId, chapterIds) {
+  await flush();
+  const { filename, text, chapterCount } = await api(urlFor(projectId, '/export-txt'), 'POST', { chapterIds });
+  if (window.agentWriter?.saveTxt) {
+    const outcome = await window.agentWriter.saveTxt(filename, text);
+    if (outcome.error) throw new Error(outcome.error);
+    if (!outcome.saved) return false;
+  } else {
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  }
+  notify(`已导出 ${chapterCount} 章 TXT`);
+  return true;
+}
+
+function exportChapterDialog() {
+  const book = project();
+  const activeChapter = chapter(book).id;
+  showDialog('导出 TXT', `<fieldset class="export-range"><legend>导出范围</legend>
+    <label><input type="radio" name="exportScope" value="selected" checked>选定章节</label>
+    <label><input type="radio" name="exportScope" value="book">全书</label></fieldset>
+    <div class="export-choices">
+      <div class="export-choices-head"><label><input type="checkbox" data-export-all>全选章节</label><small class="muted" data-export-count role="status"></small></div>
+      <div class="export-choices-list" role="group" aria-label="选择要导出的章节">
+        ${book.chapters.map((item, index) => `<label><input type="checkbox" name="chapterId" value="${esc(item.id)}"${item.id === activeChapter ? ' checked' : ''}><span class="chapter-number">${chapterNumber(index)}</span><span>${esc(item.title.trim() || '未命名章节')}</span></label>`).join('')}
+      </div>
+    </div>`, '导出 TXT', async (_values, data) => {
+      const chapterIds = data.get('exportScope') === 'book' ? undefined : data.getAll('chapterId');
+      return await exportTxt(book.id, chapterIds) ? undefined : false;
+    });
+  const form = dialog.querySelector('form');
+  const panel = form.querySelector('.export-choices');
+  const all = form.querySelector('[data-export-all]');
+  const count = form.querySelector('[data-export-count]');
+  const chapters = [...form.querySelectorAll('[name="chapterId"]')];
+  const submit = form.querySelector('[type="submit"]');
+  function updateSelection() {
+    const bookScope = form.elements.exportScope.value === 'book';
+    const selected = chapters.filter(field => field.checked).length;
+    panel.hidden = bookScope;
+    all.checked = selected === chapters.length;
+    all.indeterminate = selected > 0 && selected < chapters.length;
+    count.textContent = `已选 ${selected} / ${chapters.length} 章`;
+    submit.disabled = !bookScope && !selected;
+  }
+  form.addEventListener('change', event => {
+    if (event.target === all) chapters.forEach(field => { field.checked = all.checked; });
+    updateSelection();
+  });
+  updateSelection();
+}
+
+function deleteChapterDialog(id) {
+  const book = project();
+  const target = book?.chapters.find(item => item.id === id);
+  if (!target) return;
+  const title = target.title.trim() || '未命名章节';
+  const replacement = book.chapters.length === 1 ? '<p class="modal-note">删除后会新建一章空白正文。</p>' : '';
+  const linked = book.scenes.some(scene => scene.chapterId === id) ?
+    '<p class="modal-note">已关联的大纲场景会保留，章节链接会解除。</p>' : '';
+  const snapshots = book.memories.length ? '<p class="modal-note">已保存的记忆会保留。</p>' : '';
+  showDialog('删除章节', `<p class="modal-note">确定删除「${esc(title)}」及其正文和对话记录吗？此操作无法撤销。</p>${linked}${replacement}${snapshots}`,
+    '确认删除', async () => {
+      await patchBook(book, { removeChapterId: id });
+      const key = `${book.id}/${id}`;
+      ui.drafts.delete(key);
+      ui.entries.delete(key);
+      ui.draftAttachments.delete(key);
+      ui.historyErrors.delete(key);
+      if (project()?.id !== book.id) return;
+      ui.chapterId = chapter(book).id;
+      localWrite(storageKey('chapter'), ui.chapterId);
+      const reading = selection();
+      if (Array.isArray(reading.chapters) && reading.chapters.includes(id)) {
+        localWrite(storageKey('reading'), { ...reading, chapters: reading.chapters.filter(item => item !== id) });
+      }
+      render();
+      notify('已删除章节');
+      return app.querySelector(`.chapter-link[data-id="${CSS.escape(ui.chapterId)}"]`);
+    }, { danger: true });
 }
 
 const typeNames = { character: '角色', prop: '道具', location: '地点', organization: '组织' };
@@ -447,6 +638,11 @@ function fileData(file) {
   });
 }
 
+async function packLocalFile(file) {
+  if (file.size > maxFileBytes) throw new Error('单个文件不能超过 25 MB。');
+  return { name: file.name, data: await fileData(file) };
+}
+
 async function uploadFiles(files) {
   if (!files.length) return;
   const target = project();
@@ -456,8 +652,7 @@ async function uploadFiles(files) {
   for (const [index, file] of Array.from(files).entries()) {
     notify(`正在读取 ${index + 1}/${files.length}：${file.name}`);
     try {
-      if (file.size > 25 * 1024 * 1024) throw new Error('文件超过 25 MB。');
-      const incoming = await api(urlFor(target.id, '/references'), 'POST', { name: file.name, data: await fileData(file) });
+      const incoming = await api(urlFor(target.id, '/references'), 'POST', await packLocalFile(file));
       target.references = incoming.references;
       mergeBook(target, incoming);
       if (project()?.id === target.id) ui.referenceId = incoming.references.at(-1).id;
@@ -519,36 +714,199 @@ async function providerForm(test = false) {
 
 async function generate() {
   const key = threadKey();
-  if (ui.generating.has(key)) return;
+  const origin = projectKey();
+  if (ui.agentRuns.has(origin) || ui.readingAttachments.has(key)) return;
+  if (!ui.entries.has(key)) {
+    await loadConversation(key);
+    if (key !== threadKey() || ui.agentRuns.has(origin) || ui.readingAttachments.has(key)) return;
+  }
   const prompt = (ui.drafts.get(key) || '').trim();
-  if (!prompt) {
+  const attachments = ui.draftAttachments.get(key) || [];
+  if (!prompt && !attachments.length) {
     document.getElementById('assistant-prompt')?.focus();
     return;
   }
   const p = project();
   const c = chapter();
   const entries = ui.entries.get(key) || [];
+  const recentFiles = entries.slice().reverse().filter(item => !item.failed).flatMap(item => item.attachments?.map(file => file.id) || []);
   const request = {
-    chapterId: c.id, selected: selection(), prompt, mode: ui.mode, providerId: state.activeProviderId,
-    conversation: entries.slice(-6).filter(item => item.role !== 'error').map(({ role, text }) => ({ role, text })),
+    chapterId: c?.id, selected: p ? selection() : {}, depth: readingDepth(), prompt, mode: ui.mode, providerId: state.activeProviderId,
+    attachmentIds: attachments.map(file => file.id),
+    recentAttachmentIds: [...new Set(recentFiles)].slice(0, maxChatAttachments),
   };
-  entries.push({ role: 'user', text: prompt });
+  const message = { role: 'user', text: prompt, attachments };
+  entries.push(message);
   ui.entries.set(key, entries);
-  ui.generating.add(key);
+  const job = { key, origin, entries, message, busy: true, pending: null };
+  ui.agentRuns.set(origin, job);
   ui.drafts.set(key, '');
+  ui.draftAttachments.delete(key);
   ui.assistantTab = 'conversation';
   render();
+  await agentTurn(job, p ? urlFor(p.id, '/generate') : '/api/agent/generate', request);
+}
+
+async function syncAgentResult(job, result) {
+  const onOrigin = projectKey() === job.origin;
+  if (result.changed) {
+    const current = projectKey();
+    await flush();
+    const next = await api('/api/state');
+    const selected = !onOrigin ? current : result.ui?.projectId ?? current;
+    if (next.projects.some(book => book.id === selected)) next.activeProjectId = selected;
+    state = next;
+  } else if (result.memories) {
+    const book = state.projects.find(item => item.id === job.origin);
+    if (book) book.memories = result.memories;
+  }
+  if (!onOrigin || !result.ui) return;
+  if (projectKey() !== job.origin) resetProject();
+  if (result.ui.chapterId && project()?.chapters.some(item => item.id === result.ui.chapterId)) {
+    ui.chapterId = result.ui.chapterId;
+    localWrite(storageKey('chapter'), ui.chapterId);
+  }
+  if (project() && result.ui.reading) localWrite(storageKey('reading'), { ...selection(), ...result.ui.reading });
+  if (project() && result.ui.depth) localWrite(storageKey('reading-depth'), result.ui.depth);
+  if (result.ui.mode) ui.mode = result.ui.mode;
+  if (result.ui.view && (project() || ['write', 'providers'].includes(result.ui.view))) {
+    if (ui.view !== result.ui.view) navigate(result.ui.view);
+  }
+  const destination = threadKey();
+  if (destination !== job.key && project()) {
+    if (!result.historyError) await loadConversation(destination, true);
+    else ui.entries.set(destination, [...(ui.entries.get(destination) ?? []), ...job.entries.slice(-2)]);
+    ui.assistantTab = 'conversation';
+  }
+}
+
+async function agentTurn(job, path, request) {
+  job.busy = true;
   try {
     await flush();
-    const result = await api(urlFor(p.id, '/generate'), 'POST', request);
-    entries.push({ id: crypto.randomUUID(), role: 'assistant', text: result.text, report: result.report });
-    p.memories = result.memories;
+    const result = await api(path, 'POST', request);
+    if (result.historyError) notify(result.historyError, true);
+    if (job.pending) job.entries.pop();
+    job.pending = result.pending ?? null;
+    if (job.pending) {
+      job.entries.push({ role: 'tool_request', pending: job.pending });
+      return;
+    }
+    job.entries.push({
+      id: result.entryId ?? crypto.randomUUID(), role: result.error ? 'error' : 'assistant',
+      text: result.error || result.text, report: result.report, trace: result.trace,
+      allowApply: !result.changed && job.origin !== 'workspace',
+    });
+    try { await syncAgentResult(job, result); }
+    catch (error) { notify(error.message, true); }
   } catch (error) {
-    entries.push({ role: 'error', text: error.message });
-    if (state.projects.includes(p) && !ui.drafts.get(key)) ui.drafts.set(key, prompt);
+    if (job.pending) job.entries.pop();
+    job.pending = null;
+    job.entries.push({ role: 'error', text: error.message });
+    if (!request.id) {
+      job.message.failed = true;
+      if (!ui.drafts.get(job.key)) ui.drafts.set(job.key, job.message.text);
+      if (job.message.attachments.length) ui.draftAttachments.set(job.key, job.message.attachments);
+    }
   } finally {
-    ui.generating.delete(key);
-    if (project()?.id === p.id && chapter().id === c.id && ui.view === 'write') render();
+    job.busy = false;
+    if (!job.pending) ui.agentRuns.delete(job.origin);
+    if (ui.view === 'write' || !job.pending) render();
+  }
+}
+
+function chooseAgentFile(purpose) {
+  if (window.agentWriter?.pickToolFile) return window.agentWriter.pickToolFile(purpose);
+  return new Promise((resolve, reject) => {
+    const field = document.createElement('input');
+    field.type = 'file';
+    field.hidden = true;
+    field.accept = purpose === 'article' ? '.txt,.text,.md,.markdown,.docx,.odt,.pdf,.epub,.html,.htm,.xhtml'
+      : '.txt,.text,.md,.markdown,.csv,.tsv,.json,.jsonl,.html,.htm,.xhtml,.xml,.docx,.pdf,.epub,.odt';
+    document.body.append(field);
+    field.addEventListener('cancel', () => { field.remove(); resolve(null); }, { once: true });
+    field.addEventListener('change', async () => {
+      const file = field.files[0];
+      field.remove();
+      if (!file) return resolve(null);
+      try { resolve(await packLocalFile(file)); }
+      catch (error) { reject(error); }
+    }, { once: true });
+    field.click();
+  });
+}
+
+function updateComposerAttachments(key) {
+  const form = document.getElementById('assistant-form');
+  if (!form || key !== threadKey()) return;
+  const files = ui.draftAttachments.get(key) || [];
+  const loading = ui.readingAttachments.has(key);
+  const locked = ui.agentRuns.has(projectKey());
+  const full = files.length >= maxChatAttachments;
+  form.querySelector('#composer-attachments').innerHTML = composerAttachments(files, loading, locked);
+  const add = form.querySelector('[data-act="attachment-add"]');
+  add.disabled = locked || loading || full;
+  add.title = full ? '每条消息最多 5 个附件' : '添加附件，也可拖入文本文件（单个最多 25 MB）';
+  form.querySelector('.send-button').disabled = locked || loading;
+  form.toggleAttribute('data-drop-disabled', add.disabled);
+}
+
+async function addChatAttachments(selectFiles) {
+  const key = threadKey();
+  if (ui.agentRuns.has(projectKey()) || ui.readingAttachments.has(key)) return;
+  const available = maxChatAttachments - (ui.draftAttachments.get(key)?.length || 0);
+  if (!available) throw new Error('每条消息最多 5 个附件。');
+  ui.readingAttachments.add(key);
+  try {
+    const selection = selectFiles();
+    updateComposerAttachments(key);
+    const files = await selection;
+    const errors = [];
+    for (const file of files.slice(0, available)) {
+      try {
+        if (file.error) throw new Error(file.error);
+        const attachment = await api('/api/agent/attachments', 'POST', file instanceof File ? await packLocalFile(file) : file);
+        ui.draftAttachments.set(key, [...(ui.draftAttachments.get(key) || []), attachment]);
+      } catch (error) {
+        errors.push(file.name ? `「${file.name}」${error.message}` : error.message);
+      }
+    }
+    if (files.length > available) errors.push('每条消息最多 5 个附件。');
+    if (errors.length) notify(errors.join(' '), true);
+  } finally {
+    ui.readingAttachments.delete(key);
+    updateComposerAttachments(key);
+    if (key === threadKey() && document.activeElement === document.body) document.getElementById('assistant-prompt')?.focus();
+  }
+}
+
+async function answerAgentRequest(button, droppedFile) {
+  const job = ui.agentRuns.get(projectKey());
+  if (!job?.pending || job.pending.id !== button.dataset.id || job.busy || button.disabled) return;
+  const approval = { id: job.pending.id, approved: !button.hasAttribute('data-decline') };
+  const prompt = button.closest('.tool-request');
+  const controls = [...prompt.querySelectorAll('button')];
+  prompt.setAttribute('data-drop-disabled', '');
+  controls.forEach(control => { control.disabled = true; });
+  try {
+    if (approval.approved && job.pending.kind === 'key') {
+      const input = prompt.querySelector('input');
+      if (!input.value.trim()) { input.focus(); throw new Error('请在本机输入 API Key。'); }
+      approval.key = input.value;
+      input.value = '';
+    }
+    if (approval.approved && job.pending.kind === 'file') {
+      approval.file = await (droppedFile ? packLocalFile(droppedFile) : chooseAgentFile(job.pending.purpose));
+      if (!approval.file) return;
+      if (approval.file.error) throw new Error(approval.file.error);
+    }
+    if (approval.approved && job.pending.kind === 'copy') await navigator.clipboard.writeText(job.pending.text);
+    if (approval.approved && job.pending.kind === 'link') window.open(job.pending.url, '_blank', 'noopener,noreferrer');
+    if (approval.approved && job.pending.kind === 'export' && !await exportTxt(job.pending.projectId, job.pending.chapterIds)) return;
+    await agentTurn(job, urlFor(job.origin, '/agent/continue'), approval);
+  } finally {
+    controls.forEach(control => { control.disabled = false; });
+    prompt.removeAttribute('data-drop-disabled');
   }
 }
 
@@ -579,6 +937,19 @@ const actions = {
   navigate: el => navigate(el.dataset.id),
   'mobile-nav': () => { ui.mobileNav = !ui.mobileNav; render(); },
   'mobile-assistant': () => { ui.mobileAssistant = !ui.mobileAssistant; render(); },
+  'agent-decision': answerAgentRequest,
+  'attachment-add': () => addChatAttachments(async () => {
+    const file = await chooseAgentFile('attachment');
+    return file ? [file] : [];
+  }),
+  'attachment-remove': el => {
+    const key = threadKey();
+    const files = (ui.draftAttachments.get(key) || []).filter(file => file.id !== el.dataset.id);
+    if (files.length) ui.draftAttachments.set(key, files);
+    else ui.draftAttachments.delete(key);
+    updateComposerAttachments(key);
+    document.getElementById('assistant-prompt')?.focus();
+  },
   'project-add': projectDialog,
   'article-import': articleImportDialog,
   'project-switch': async el => {
@@ -594,8 +965,11 @@ const actions = {
     navigate('write');
     app.querySelector('.project-selector')?.focus({ preventScroll: true });
   },
+  'project-rename': el => renameProjectDialog(el.dataset.id),
   'project-delete': el => deleteProjectDialog(el.dataset.id),
   'chapter-add': chapterDialog,
+  'chapter-export': exportChapterDialog,
+  'chapter-delete': el => deleteChapterDialog(el.dataset.id),
   chapter: async el => {
     const current = project();
     await flush();
@@ -611,6 +985,10 @@ const actions = {
   'dialog-close': () => dialog.close(),
   'dialog-remove': () => dialog.removeAction?.(),
   'assistant-tab': el => { ui.assistantTab = el.dataset.id; render(); },
+  'history-retry': async () => {
+    try { await loadConversation(threadKey(), true); }
+    finally { render(); }
+  },
   'sources-info': () => { ui.sourcesInfo = !ui.sourcesInfo; render(); },
   'source-expand': el => {
     const key = el.dataset.id;
@@ -631,6 +1009,7 @@ const actions = {
     notify('已复制');
   },
   'response-apply': async el => {
+    if (ui.agentRuns.has(projectKey())) throw new Error('请等当前工具操作完成后再写入正文。');
     const result = ui.entries.get(threadKey())?.find(item => item.id === el.dataset.id);
     if (!result) return;
     const c = chapter();
@@ -675,26 +1054,59 @@ const actions = {
       notify('已移除参考资料');
     });
   },
-  'memory-save': async () => {
+  'memory-save': async button => {
     const p = project();
     const chapterId = chapter(p).id;
-    await flush();
-    const result = await api(urlFor(p.id, '/memories'), 'POST', { chapterId });
-    const added = result.memories.length > p.memories.length;
-    mergeBook(p, result);
-    render();
-    notify(added ? '已保存当前记忆' : '当前内容已经存入记忆');
+    button.disabled = true;
+    try {
+      await flush();
+      const result = await api(urlFor(p.id, '/memories'), 'POST', { chapterId });
+      mergeBook(p, result);
+      if (project()?.id !== p.id || ui.view !== 'memories') return;
+      updateMemoryContent();
+      notify('已保存当前记忆');
+      await refreshMemories();
+    } finally {
+      button.disabled = false;
+    }
+  },
+  'memory-tab': el => setMemoryTab(el.dataset.id),
+  'memory-filter': el => {
+    ui.memoryFilter = el.dataset.id;
+    updateMemoryContent();
+  },
+  'memory-retry': async el => {
+    const p = project();
+    el.disabled = true;
+    try {
+      const result = await api(urlFor(p.id, `/memories/${el.dataset.id}/retry-${el.dataset.kind}`), 'POST', {});
+      mergeBook(p, result);
+      if (project()?.id === p.id && ui.view === 'memories') updateMemoryContent();
+    } finally {
+      el.disabled = false;
+    }
+  },
+  'plot-source': async el => {
+    const book = project();
+    await loadConversation(`${book.id}/${el.dataset.id}`).catch(() => {});
+    if (book.id !== project()?.id) return;
+    await actions.chapter(el);
+    if (chapter()?.id !== el.dataset.id || ui.view !== 'write') return;
+    const area = document.getElementById('chapter-text');
+    const offset = Number(el.dataset.offset);
+    area?.focus();
+    area?.setSelectionRange(offset, offset + Number(el.dataset.length));
   },
   'memory-select': async el => {
     const { id } = el.dataset;
+    const p = project();
     ui.memoryId = id;
     ui.memoryDetail = null;
-    render();
-    const p = project();
+    setMemoryTab('history');
     const detail = await api(urlFor(p.id, '/memories/' + id));
     if (ui.memoryId === id && project()?.id === p.id && ui.view === 'memories') {
       ui.memoryDetail = detail;
-      render();
+      updateMemoryContent();
     }
   },
 };
@@ -741,6 +1153,10 @@ document.addEventListener('invalid', event => {
   field.focus();
 }, true);
 
+dialog.addEventListener('cancel', event => {
+  if (dialog.querySelector('form[aria-busy="true"]')) event.preventDefault();
+});
+
 document.addEventListener('submit', event => {
   const form = event.target;
   const formId = form.getAttribute('id');
@@ -760,15 +1176,19 @@ document.addEventListener('submit', event => {
       notify('已保存记忆规则');
     },
     'modal-form': async () => {
-      const submit = form.querySelector('button[type="submit"]');
-      if (submit) submit.disabled = true;
+      if (form.getAttribute('aria-busy') === 'true') return;
+      const controls = form.querySelectorAll('button[type="submit"], [data-act^="dialog-"]');
+      controls.forEach(button => { button.disabled = true; });
+      form.setAttribute('aria-busy', 'true');
       try {
-        await dialogAction(Object.fromEntries(data), data);
-        dialog.close();
+        const focus = await dialogAction(Object.fromEntries(data), data);
+        if (focus !== false) dialog.close();
+        if (focus instanceof HTMLElement) focus.focus({ preventScroll: true });
       } catch (error) {
         showFormError(form, error.message);
       } finally {
-        if (submit) submit.disabled = false;
+        controls.forEach(button => { button.disabled = false; });
+        form.removeAttribute('aria-busy');
       }
     },
   }[formId];
@@ -791,8 +1211,11 @@ document.addEventListener('input', event => {
       document.getElementById('chapter-count').textContent = countWords(c.text).toLocaleString('zh-CN');
       fitManuscript();
     } else {
-      const current = app.querySelector('.chapter-link.is-active span:last-child');
-      if (current) current.textContent = c.title.trim() || '未命名章节';
+      const current = app.querySelector('.chapter-row.is-active');
+      const title = c.title.trim() || '未命名章节';
+      current.querySelector('.chapter-link span:last-child').textContent = title;
+      current.querySelector('.chapter-link').title = title;
+      current.querySelector('.chapter-delete').setAttribute('aria-label', `删除章节「${title}」`);
     }
     stage({ chapter: c });
   }
@@ -818,6 +1241,19 @@ document.addEventListener('change', event => {
       await chooseProvider(el.value);
     } else if (el.id === 'assistant-mode') {
       ui.mode = el.value;
+    } else if (el.id === 'reading-deep') {
+      localWrite(storageKey('reading-depth'), el.checked ? 'deep' : 'standard');
+    } else if (['memory-extraction-toggle', 'memory-plot-toggle'].includes(el.id)) {
+      const p = project();
+      const setting = el.id === 'memory-plot-toggle' ? 'extractPlot' : 'extractCards';
+      el.disabled = true;
+      try {
+        await patchBook(p, { memorySettings: { [setting]: el.checked } });
+        if (project()?.id === p.id && ui.view === 'memories') updateMemoryContent();
+      } finally {
+        el.checked = p.memorySettings?.[setting] === true;
+        el.disabled = false;
+      }
     } else if (el.id === 'reference-files') {
       const files = Array.from(el.files || []);
       el.value = '';
@@ -849,22 +1285,30 @@ document.addEventListener('dragstart', event => {
   event.dataTransfer.setData('text/plain', card?.dataset.dragCard || scene.dataset.dragScene);
 });
 
-function dragTarget(event) {
-  if (event.dataTransfer.types.includes('Files')) return event.target.closest('[data-drop="references"]');
-  if (drag?.card) return event.target.closest('[data-drop-scene]');
-  if (drag?.scene) return event.target.closest('[data-drop-scene], [data-drop-act]');
+function dragTarget(event, isFile) {
+  if (isFile) {
+    const target = event.target.closest?.('[data-drop]');
+    return target?.closest('[data-drop-disabled], [aria-busy="true"]') ? null : target;
+  }
+  if (drag?.card) return event.target.closest?.('[data-drop-scene]');
+  if (drag?.scene) return event.target.closest?.('[data-drop-scene], [data-drop-act]');
   return null;
 }
 
 function clearDrop() {
-  app.querySelectorAll('.drop-over').forEach(el => el.classList.remove('drop-over'));
+  document.querySelectorAll('.drop-over').forEach(el => el.classList.remove('drop-over'));
 }
 
 document.addEventListener('dragover', event => {
-  const target = dragTarget(event);
-  if (!target) return;
-  event.preventDefault();
-  event.dataTransfer.dropEffect = drag?.scene ? 'move' : 'copy';
+  const isFile = event.dataTransfer.types.includes('Files');
+  const target = dragTarget(event, isFile);
+  if (isFile || target) event.preventDefault();
+  if (!target) {
+    if (isFile) event.dataTransfer.dropEffect = 'none';
+    clearDrop();
+    return;
+  }
+  event.dataTransfer.dropEffect = !isFile && drag?.scene ? 'move' : 'copy';
   if (!target.classList.contains('drop-over')) {
     clearDrop();
     target.classList.add('drop-over');
@@ -872,21 +1316,32 @@ document.addEventListener('dragover', event => {
 });
 
 document.addEventListener('dragleave', event => {
-  const target = event.target.closest('.drop-over');
+  const target = event.target.closest?.('.drop-over');
   if (target && !target.contains(event.relatedTarget)) target.classList.remove('drop-over');
 });
 
 document.addEventListener('dragend', () => { drag = null; clearDrop(); });
 
+async function importDroppedFiles(target, files) {
+  if (!files.length) return;
+  if (target.dataset.drop === 'references') return uploadFiles(files);
+  if (target.dataset.drop === 'chat') return addChatAttachments(() => files);
+  if (files.length !== 1) throw new Error('请一次拖入一个文件。');
+  if (target.dataset.drop === 'article') return articleDrops.get(target)?.(files[0]);
+  const button = target.querySelector('[data-act="agent-decision"]:not([data-decline])');
+  if (button) return answerAgentRequest(button, files[0]);
+}
+
 document.addEventListener('drop', event => {
-  const target = dragTarget(event);
-  if (!target) return;
-  event.preventDefault();
+  const isFile = event.dataTransfer.types.includes('Files');
+  const target = dragTarget(event, isFile);
+  if (isFile || target) event.preventDefault();
   const payload = drag;
   drag = null;
   clearDrop();
+  if (!target) return;
   let operation;
-  if (target.dataset.drop === 'references') operation = uploadFiles(event.dataTransfer.files);
+  if (isFile) operation = importDroppedFiles(target, Array.from(event.dataTransfer.files));
   else if (payload?.card) {
     const scene = project().scenes.find(item => item.id === target.dataset.dropScene);
     if (scene) operation = linkCard(payload.card, scene);
@@ -941,9 +1396,15 @@ try {
   state = await api('/api/state');
   resetProject();
   render();
+  if (ui.view === 'memories') refreshMemories().catch(error => notify(error.message, true));
   setInterval(() => {
-    if (ui.view === 'memories' && document.visibilityState === 'visible') refreshMemories().catch(() => {});
-  }, 60_000);
+    if (ui.view !== 'memories' || document.visibilityState !== 'visible') return;
+    const p = project();
+    const waiting = p && memoryModel() && p.memories.some(entry =>
+      (p.memorySettings.extractCards === true && entry.cardExtraction?.status === 'pending') ||
+      (p.memorySettings.extractPlot === true && entry.plotExtraction?.status === 'pending'));
+    if (waiting || Date.now() - memoryRefreshedAt >= 60_000) refreshMemories().catch(() => {});
+  }, 2500);
 } catch (error) {
   app.innerHTML = `<div class="startup"><p>${esc(error.message)}</p><a href="/">重新打开工作区</a></div>`;
 }

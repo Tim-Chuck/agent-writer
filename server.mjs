@@ -4,11 +4,19 @@ import { spawn } from 'node:child_process';
 import { basename, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openStore } from './lib/store.mjs';
-import { makeId, makeProject } from './lib/projects.mjs';
-import { buildContext, captureMemory, checkDue, isNextChapterIntent, recordChanges } from './lib/memory.mjs';
+import { makeChapter, makeId, makeProject } from './lib/projects.mjs';
+import { buildContext, captureMemory, checkDue, conversationContext, isNextChapterIntent, recordChanges } from './lib/memory.mjs';
+import { createMemoryCardWorker, memoryCards } from './lib/memory-cards.mjs';
+import { chapterPlotPoints } from './lib/story-notes.mjs';
 import { callProvider, normalizeProviderEndpoint, normalizeProviderModel, providerPresets } from './lib/providers.mjs';
 import { extractReference } from './lib/imports.mjs';
 import { extractArticle, MAX_ARTICLE_CHAPTERS, MAX_CHAPTER_CHARACTERS } from './lib/articles.mjs';
+import { createWorkspaceTools } from './lib/workspace-tools.mjs';
+import { createAgentRunner } from './lib/agent-runner.mjs';
+import { chapterGenerationIntent } from './lib/ai-chapters.mjs';
+import { createChatAttachments, withChatAttachments } from './lib/chat-attachments.mjs';
+import { beginConversationTurn, conversationEntries, saveConversationTurn } from './lib/conversations.mjs';
+import { txtExport } from './lib/txt-export.mjs';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
 const defaultDirectory = resolve(root, '.writer-data');
@@ -48,11 +56,16 @@ function requireProject(state, id) {
   return project;
 }
 
-function memoryHeader({ snapshot, ...header }) {
+function memoryHeader({ snapshot, cardExtraction, plotExtraction, ...header }) {
+  for (const [field, extraction] of [['cardExtraction', cardExtraction], ['plotExtraction', plotExtraction]]) {
+    if (!extraction) continue;
+    const { cards, points, chapterIds, baseMemoryId, ...status } = extraction;
+    header[field] = { ...status, count: (cards || points)?.length ?? 0 };
+  }
   return header;
 }
 
-function projectView(project) {
+function projectView({ conversations, ...project }) {
   return { ...project, memories: project.memories.map(memoryHeader) };
 }
 
@@ -83,9 +96,25 @@ const lists = {
   }),
 };
 
+function removeChapter(project, id) {
+  const index = project.chapters.findIndex(chapter => chapter.id === id);
+  if (index === -1) throw new UserError('找不到这个章节，请重新打开项目。', 404);
+  const chapters = project.chapters.filter(chapter => chapter.id !== id);
+  if (!chapters.length) chapters.push(makeChapter('第一章'));
+  if (!chapters.some(chapter => chapter.id === project.activeChapterId)) {
+    project.activeChapterId = chapters[Math.min(index, chapters.length - 1)].id;
+  }
+  project.chapters = chapters;
+}
+
 function updateProject(project, input) {
   const before = { ...project };
-  if (typeof input.title === 'string' && input.title.trim()) project.title = brief(input.title.trim(), 120);
+  const startPlot = input.memorySettings?.extractPlot === true && project.memorySettings.extractPlot !== true;
+  if (typeof input.title === 'string') {
+    const title = brief(input.title.trim(), 120);
+    if (!title) throw new UserError('请填写作品名称。');
+    project.title = title;
+  }
   if (typeof input.description === 'string') project.description = brief(input.description, 8_000);
   if (typeof input.planning === 'string') project.planning = brief(input.planning, 100_000);
   for (const [kind, normalize] of Object.entries(lists)) {
@@ -110,6 +139,16 @@ function updateProject(project, input) {
     }
     project.chapters = [...project.chapters, lists.chapters(next)];
   }
+  const removingChapter = typeof input.removeChapterId === 'string';
+  if (removingChapter) removeChapter(project, input.removeChapterId);
+  if (removingChapter || Array.isArray(input.chapters) || Array.isArray(input.scenes)) {
+    const chapterIds = new Set(project.chapters.map(chapter => chapter.id));
+    project.scenes = project.scenes.map(scene =>
+      scene.chapterId && !chapterIds.has(scene.chapterId) ? { ...scene, chapterId: '' } : scene);
+    if (project.conversations && (removingChapter || Array.isArray(input.chapters))) {
+      project.conversations = Object.fromEntries(Object.entries(project.conversations).filter(([id]) => chapterIds.has(id)));
+    }
+  }
   const referenceIds = input.removeReferences;
   if (Array.isArray(referenceIds)) {
     project.references = project.references.filter(item => !referenceIds.includes(item.id));
@@ -119,7 +158,7 @@ function updateProject(project, input) {
   }
   if (input.memorySettings && typeof input.memorySettings === 'object') {
     const settings = input.memorySettings;
-    for (const name of ['chapterEnabled', 'weeklyEnabled', 'volumeEnabled']) {
+    for (const name of ['chapterEnabled', 'weeklyEnabled', 'volumeEnabled', 'extractCards', 'extractPlot']) {
       if (typeof settings[name] === 'boolean') project.memorySettings[name] = settings[name];
     }
     for (const [name, low, high] of [['intervalDays', 1, 365], ['characterThreshold', 1, 1_000_000]]) {
@@ -135,6 +174,10 @@ function updateProject(project, input) {
     const existingIds = new Set(before.chapters.map(chapter => chapter.id));
     const previousChapters = project.chapters.filter(chapter => existingIds.has(chapter.id));
     captureMemory({ ...project, chapters: previousChapters }, { reasons: ['chapter'], chapterId: input.finishChapterId });
+  }
+  if (startPlot && project.chapters.some(chapter => chapter.text.trim()) &&
+      !project.memories.some(memory => memory.plotExtraction?.status === 'pending')) {
+    captureMemory(project, { chapterId: project.activeChapterId });
   }
   checkDue(project);
   return projectView(project);
@@ -172,20 +215,110 @@ function readProvider(input, existing, store) {
   if (!key && !local) {
     throw new UserError(existing?.secret && !sameService ? '你更换了 API 服务地址，请填入新服务的 API 密钥。' : '请填写该供应商的 API 密钥。');
   }
-  return { id: preset.id, ...destination, model, name, key };
+  const previousWindow = sameService && existing?.model === model ? existing.contextTokens : undefined;
+  const value = input.contextTokens;
+  const contextTokens = value === undefined ? previousWindow : value === '' || value === null ? undefined : Number(value);
+  if (contextTokens !== undefined && (!Number.isSafeInteger(contextTokens) || contextTokens < 4096 || contextTokens > 2_000_000)) {
+    throw new UserError('上下文窗口请输入 4,096 到 2,000,000 之间的 token 数，或留空。');
+  }
+  return { id: preset.id, ...destination, model, name, key, ...(contextTokens ? { contextTokens } : {}) };
 }
 
-async function api(req, res, pathname, store) {
+function saveProvider(state, { key, ...saved }, store) {
+  const provider = { ...saved, secret: key ? store.seal(key) : '' };
+  state.providers[saved.id] = provider;
+  state.activeProviderId = saved.id;
+  return provider;
+}
+
+function testProvider(config) {
+  return callProvider(config, { system: '你正在测试模型连接。', prompt: '只回复四个字：连接成功。' });
+}
+
+function deleteProject(state, id) {
+  requireProject(state, id);
+  const removedIndex = state.projects.findIndex(project => project.id === id);
+  state.projects.splice(removedIndex, 1);
+  if (state.activeProjectId === id) {
+    state.activeProjectId = state.projects[Math.min(removedIndex, state.projects.length - 1)]?.id ?? '';
+  }
+  return { activeProjectId: state.activeProjectId };
+}
+
+function importArticle(state, input) {
+  if (!Array.isArray(input.chapters) || !input.chapters.length || input.chapters.length > MAX_ARTICLE_CHAPTERS) {
+    throw new UserError('请检查要导入的章节。');
+  }
+  const title = brief(input.title, 120).trim();
+  if (!input.projectId && !title) throw new UserError('请填写新项目的作品名称。');
+  const chapters = input.chapters.map(chapter => {
+    if (typeof chapter?.title !== 'string' || !chapter.title.trim() || typeof chapter.text !== 'string') {
+      throw new UserError('章节标题或正文格式有误，请重新选择文件。');
+    }
+    if (chapter.text.length > MAX_CHAPTER_CHARACTERS) {
+      throw new UserError('单章正文超过 150 万字符。请启用自动分章，或把文件分成多份导入。');
+    }
+    return lists.chapters({ ...chapter, id: makeId() });
+  });
+  const target = input.projectId ? requireProject(state, input.projectId) : makeProject(title);
+  const before = { ...target };
+  const first = target.chapters[0];
+  const reuseBlank = target.chapters.length === 1 && first.title === '第一章' && first.text === '';
+  const available = MAX_ARTICLE_CHAPTERS - target.chapters.length + Number(reuseBlank);
+  if (chapters.length > available) throw new UserError('导入后项目将超过 2000 章。请选择新项目或分开导入。');
+  const imported = reuseBlank ? [{ ...chapters[0], id: first.id }, ...chapters.slice(1)] : chapters;
+  target.chapters = [...(reuseBlank ? [] : target.chapters), ...imported];
+  target.activeChapterId = imported[0].id;
+  target.updatedAt = new Date().toISOString();
+  recordChanges(target, before);
+  checkDue(target);
+  if (!input.projectId) state.projects.push(target);
+  state.activeProjectId = target.id;
+  return projectView(target);
+}
+
+function addReference(project, imported) {
+  const before = { ...project, references: [...project.references] };
+  const reference = { ...imported, id: makeId(), addedAt: new Date().toISOString() };
+  project.references.push(reference);
+  project.updatedAt = new Date().toISOString();
+  recordChanges(project, before);
+  checkDue(project);
+  return reference;
+}
+
+function retryExtraction(project, id, kind = 'cards') {
+  const plot = kind === 'plot';
+  if (project.memorySettings?.[plot ? 'extractPlot' : 'extractCards'] !== true) throw new UserError('请先在记忆页开启对应的自动提取。');
+  const memory = project.memories.find(entry => entry.id === id);
+  const status = memory?.[plot ? 'plotExtraction' : 'cardExtraction'];
+  if (!status) throw new UserError('找不到这次提取记录。', 404);
+  if (status.status === 'failed') {
+    status.status = 'pending';
+    delete status.error;
+  }
+}
+
+function chatInput(input, chatFiles) {
+  let attachments;
+  try { attachments = chatFiles.get(input.attachmentIds, input.recentAttachmentIds); }
+  catch (error) { throw new UserError(error.message); }
+  const prompt = brief(input.prompt, 16_000).trim();
+  if (!prompt && !attachments.some(file => file.attached)) throw new UserError('请输入消息或添加附件。');
+  return { prompt: prompt || '请阅读这条消息附带的文件，并简要概括内容。', attachments };
+}
+
+async function api(req, res, pathname, store, cardWorker, agent, chatFiles) {
   const method = req.method;
   if (method === 'GET' && pathname === '/api/state') {
     await dueForAll(store);
-    const state = await store.read();
-    send(res, 200, {
+    const view = await store.read(({ workspaceConversation, ...state }) => ({
       ...state,
       projects: state.projects.map(projectView),
       providers: Object.fromEntries(Object.entries(state.providers).map(([id, item]) => [id, providerView(item)])),
       presets: providerPresets,
-    });
+    }));
+    send(res, 200, view);
     return;
   }
   if (method === 'POST' && pathname === '/api/projects') {
@@ -201,6 +334,38 @@ async function api(req, res, pathname, store) {
     send(res, 201, project);
     return;
   }
+  if (method === 'POST' && pathname === '/api/agent/attachments') {
+    const input = await body(req, 36 * 1024 * 1024);
+    if (typeof input.name !== 'string' || typeof input.data !== 'string') throw new UserError('请选择要添加的文件。');
+    let file;
+    try { file = await chatFiles.add(brief(input.name, 255), Buffer.from(input.data, 'base64')); }
+    catch (error) { throw new UserError(error.message); }
+    send(res, 201, file);
+    return;
+  }
+  if (method === 'GET' && pathname === '/api/agent/conversation') {
+    send(res, 200, { entries: await store.read(state => conversationEntries(state, '')) });
+    return;
+  }
+  if (method === 'POST' && pathname === '/api/agent/generate') {
+    const input = await body(req);
+    const { prompt, attachments } = chatInput(input, chatFiles);
+    const provider = await store.read(state => {
+      const id = input.providerId || state.activeProviderId;
+      return Object.hasOwn(state.providers, id) ? state.providers[id] : null;
+    });
+    if (!provider) throw new UserError('请先在 API 设置中连接一个模型。', 409);
+    const conversation = await beginConversationTurn(store, { projectId: '', text: brief(input.prompt, 16_000).trim(), attachments });
+    const recent = conversationContext(conversation.recent);
+    const context = { system: '你是 Agent Writer 的中文小说创作助手。当前还没有选中的作品。',
+      prompt: recent ? `${recent}\n\n# 本次要求\n${prompt}` : prompt, report: { sections: [] } };
+    const response = await agent.start({ provider: { ...provider, key: store.unseal(provider.secret) },
+      context: withChatAttachments(context, attachments), attachments, conversation,
+      generation: chapterGenerationIntent(prompt, input.mode), projectId: '', originId: 'workspace' });
+    if (response.error && !response.trace.length) throw new UserError(response.error, 502);
+    send(res, 200, response);
+    return;
+  }
   if (method === 'POST' && pathname === '/api/articles/preview') {
     const input = await body(req, 36 * 1024 * 1024);
     if (typeof input.name !== 'string' || typeof input.data !== 'string') throw new UserError('请选择要导入的文章文件。');
@@ -212,37 +377,7 @@ async function api(req, res, pathname, store) {
   }
   if (method === 'POST' && pathname === '/api/articles/import') {
     const input = await body(req, 16 * 1024 * 1024);
-    if (!Array.isArray(input.chapters) || !input.chapters.length || input.chapters.length > MAX_ARTICLE_CHAPTERS) {
-      throw new UserError('请检查要导入的章节。');
-    }
-    const title = brief(input.title, 120).trim();
-    if (!input.projectId && !title) throw new UserError('请填写新项目的作品名称。');
-    const chapters = input.chapters.map(chapter => {
-      if (typeof chapter?.title !== 'string' || !chapter.title.trim() || typeof chapter.text !== 'string') {
-        throw new UserError('章节标题或正文格式有误，请重新选择文件。');
-      }
-      if (chapter.text.length > MAX_CHAPTER_CHARACTERS) {
-        throw new UserError('单章正文超过 150 万字符。请启用自动分章，或把文件分成多份导入。');
-      }
-      return lists.chapters({ ...chapter, id: makeId() });
-    });
-    const result = await store.mutate(state => {
-      const target = input.projectId ? requireProject(state, input.projectId) : makeProject(title);
-      const before = { ...target };
-      const first = target.chapters[0];
-      const reuseBlank = target.chapters.length === 1 && first.title === '第一章' && first.text === '';
-      const available = MAX_ARTICLE_CHAPTERS - target.chapters.length + Number(reuseBlank);
-      if (chapters.length > available) throw new UserError('导入后项目将超过 2000 章。请选择新项目或分开导入。');
-      const imported = reuseBlank ? [{ ...chapters[0], id: first.id }, ...chapters.slice(1)] : chapters;
-      target.chapters = [...(reuseBlank ? [] : target.chapters), ...imported];
-      target.activeChapterId = imported[0].id;
-      target.updatedAt = new Date().toISOString();
-      recordChanges(target, before);
-      checkDue(target);
-      if (!input.projectId) state.projects.push(target);
-      state.activeProjectId = target.id;
-      return projectView(target);
-    });
+    const result = await store.mutate(state => importArticle(state, input));
     send(res, 201, result);
     return;
   }
@@ -260,35 +395,51 @@ async function api(req, res, pathname, store) {
     const config = readProvider(input, state.providers[input.id], store);
     if (pathname.endsWith('/test')) {
       try {
-        await callProvider(config, { system: '你正在测试模型连接。', prompt: '只回复四个字：连接成功。' });
+        await testProvider(config);
       } catch (error) {
         throw new UserError(error.message, 502);
       }
       send(res, 200, { ok: true, endpoint: config.endpoint, protocol: config.protocol });
       return;
     }
-    const { key, ...saved } = config;
-    const provider = await store.mutate(next => {
-      next.providers[saved.id] = { ...saved, secret: key ? store.seal(key) : '' };
-      next.activeProviderId = saved.id;
-      return providerView(next.providers[saved.id]);
-    });
+    const provider = await store.mutate(next => providerView(saveProvider(next, config, store)));
     send(res, 200, provider);
     return;
   }
   const match = /^\/api\/projects\/([\w-]+)(?:\/(.+))?$/.exec(pathname);
   if (!match) throw new UserError('找不到该操作。', 404);
   const [, id, action] = match;
-  if (method === 'DELETE' && !action) {
-    const result = await store.mutate(state => {
-      requireProject(state, id);
-      const removedIndex = state.projects.findIndex(project => project.id === id);
-      state.projects.splice(removedIndex, 1);
-      if (state.activeProjectId === id) {
-        state.activeProjectId = state.projects[Math.min(removedIndex, state.projects.length - 1)]?.id ?? '';
-      }
-      return { activeProjectId: state.activeProjectId };
+  if (method === 'GET' && action?.startsWith('conversation/')) {
+    let chapterId;
+    try { chapterId = decodeURIComponent(action.slice('conversation/'.length)); }
+    catch { throw new UserError('章节编号无效。'); }
+    const entries = await store.read(state => {
+      const target = requireProject(state, id);
+      if (!target.chapters.some(chapter => chapter.id === chapterId)) throw new UserError('找不到这个章节。', 404);
+      return conversationEntries(state, id, chapterId);
     });
+    send(res, 200, { entries });
+    return;
+  }
+  if (method === 'POST' && action === 'export-txt') {
+    const input = await body(req);
+    const exported = await store.read(state => {
+      const project = requireProject(state, id);
+      try { return txtExport(project, input.chapterIds); }
+      catch (error) { throw new UserError(error.message); }
+    });
+    send(res, 200, exported);
+    return;
+  }
+  if (method === 'POST' && action === 'agent/continue') {
+    const input = await body(req, 36 * 1024 * 1024);
+    const response = await agent.resume(id, input);
+    if (!response) throw new UserError('这项确认已过期或已经处理，请重新发起操作。', 409);
+    send(res, 200, response);
+    return;
+  }
+  if (method === 'DELETE' && !action) {
+    const result = await store.mutate(state => deleteProject(state, id));
     send(res, 200, result);
     return;
   }
@@ -315,14 +466,20 @@ async function api(req, res, pathname, store) {
     catch (error) { throw new UserError(error.message); }
     const project = await store.mutate(state => {
       const target = requireProject(state, id);
-      const before = { ...target, references: [...target.references] };
-      target.references.push({ ...imported, id: makeId(), addedAt: new Date().toISOString() });
-      target.updatedAt = new Date().toISOString();
-      recordChanges(target, before);
-      checkDue(target);
+      addReference(target, imported);
       return projectView(target);
     });
     send(res, 201, project);
+    return;
+  }
+  const retryRoute = /^memories\/([\w-]+)\/retry-(cards|plot)$/.exec(action ?? '');
+  if (method === 'POST' && retryRoute) {
+    const result = await store.mutate(state => {
+      const project = requireProject(state, id);
+      retryExtraction(project, retryRoute[1], retryRoute[2]);
+      return projectView(project);
+    });
+    send(res, 200, result);
     return;
   }
   if (method === 'GET' && action?.startsWith('memories/')) {
@@ -333,9 +490,13 @@ async function api(req, res, pathname, store) {
     return;
   }
   if (method === 'GET' && action === 'memories') {
-    await dueForAll(store);
-    const project = requireProject(await store.read(), id);
-    send(res, 200, { memories: project.memories.map(memoryHeader), memoryState: project.memoryState });
+    const result = await store.read(state => {
+      const project = requireProject(state, id);
+      const points = chapterPlotPoints(project);
+      return { memories: project.memories.map(memoryHeader), memoryState: project.memoryState, cards: memoryCards(project),
+        points: project.chapters.flatMap(chapter => points.get(chapter.id) ?? []) };
+    });
+    send(res, 200, result);
     return;
   }
   if (method === 'POST' && action === 'memories') {
@@ -350,28 +511,39 @@ async function api(req, res, pathname, store) {
   }
   if (method === 'POST' && action === 'generate') {
     const input = await body(req);
-    const prompt = brief(input.prompt, 16_000).trim();
-    if (!prompt) throw new UserError('请先告诉助手你想写什么。');
+    const { prompt, attachments } = chatInput(input, chatFiles);
     const project = await store.mutate(state => {
       const target = requireProject(state, id);
       checkDue(target);
       if (target.memorySettings.chapterEnabled && isNextChapterIntent(prompt)) {
         captureMemory(target, { reasons: ['chapter'], chapterId: input.chapterId });
       }
-      return target;
+      const { conversations, ...writingContext } = target;
+      return writingContext;
     });
-    const state = await store.read();
-    const chosen = input.providerId || state.activeProviderId;
-    if (!Object.hasOwn(state.providers, chosen)) throw new UserError('请先在 API 设置中连接一个模型。', 409);
-    const provider = state.providers[chosen];
+    cardWorker.wake();
+    const provider = await store.read(state => {
+      const chosen = input.providerId || state.activeProviderId;
+      return Object.hasOwn(state.providers, chosen) ? state.providers[chosen] : null;
+    });
+    if (!provider) throw new UserError('请先在 API 设置中连接一个模型。', 409);
+    const current = project.chapters.find(chapter => chapter.id === (input.chapterId ?? project.activeChapterId)) ?? project.chapters.at(-1);
+    const conversation = await beginConversationTurn(store, { projectId: id, chapterId: current.id,
+      text: brief(input.prompt, 16_000).trim(), attachments });
+    if (!conversation) throw new UserError('找不到这个章节。', 404);
     const context = buildContext(project, {
-      chapterId: input.chapterId, selected: input.selected, prompt, mode: input.mode, conversation: input.conversation,
+      chapterId: current.id, selected: input.selected, prompt, mode: input.mode,
+      conversation: conversation.recent.length ? conversation.recent : input.conversation,
+      earlierConversation: conversation.earlier, depth: input.depth, contextTokens: provider.contextTokens,
+      attachmentCharacters: Math.min(12_000, attachments.reduce((size, file) => size + file.characters, 0)),
     });
-    let text;
-    try { text = await callProvider({ ...provider, key: store.unseal(provider.secret) }, context); }
-    catch (error) { throw new UserError(error.message, 502); }
-    const latest = requireProject(await store.read(), id);
-    send(res, 200, { text, report: context.report, provider: provider.model, memories: latest.memories.map(memoryHeader) });
+    const response = await agent.start({
+      provider: { ...provider, key: store.unseal(provider.secret) }, context: withChatAttachments(context, attachments), attachments,
+      generation: chapterGenerationIntent(prompt, input.mode), projectId: id, chapterId: context.report.chapterId, conversation,
+    });
+    if (response.error && !response.trace.length) throw new UserError(response.error, 502);
+    const memories = await store.read(state => state.projects.find(project => project.id === id)?.memories.map(memoryHeader) ?? []);
+    send(res, 200, { ...response, memories });
     return;
   }
   throw new UserError('找不到该操作。', 404);
@@ -379,7 +551,7 @@ async function api(req, res, pathname, store) {
 
 const staticFiles = new Set(['index.html', 'style.css', 'app.js', 'views.js', 'views.css', 'icons.js', 'workspace.js', 'outline.js', 'outline.css']);
 const mime = { '.js': 'text/javascript', '.css': 'text/css', '.html': 'text/html' };
-async function respond(req, res, { origin, port, token, store }) {
+async function respond(req, res, { origin, port, token, store, cardWorker, agent, chatFiles }) {
   res.setHeader('X-Agent-Writer', '1');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Content-Security-Policy', "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'");
@@ -392,7 +564,8 @@ async function respond(req, res, { origin, port, token, store }) {
     }
     const { pathname } = new URL(req.url, origin);
     if (pathname.startsWith('/api/')) {
-      await api(req, res, pathname, store);
+      await api(req, res, pathname, store, cardWorker, agent, chatFiles);
+      if (req.method !== 'GET' || pathname === '/api/state') cardWorker.wake();
       return;
     }
     if (pathname === '/favicon.ico') {
@@ -419,10 +592,15 @@ async function respond(req, res, { origin, port, token, store }) {
 
 export async function startWriterServer({ port = 4317, directory = defaultDirectory, token } = {}) {
   const store = await openStore(resolve(directory));
+  const chatFiles = createChatAttachments();
+  const cardWorker = createMemoryCardWorker(store);
+  const agent = createAgentRunner(createWorkspaceTools({ store, requireProject, updateProject, deleteProject,
+    importArticle, addReference, retryExtraction, readProvider, saveProvider, testProvider, providerView, providerPresets }),
+  cardWorker.wake, (turn, response, run) => saveConversationTurn(store, turn, response, run));
   const bind = '127.0.0.1';
   const server = createServer((req, res) => {
     const actualPort = server.address().port;
-    void respond(req, res, { origin: `http://${bind}:${actualPort}`, port: actualPort, token, store });
+    void respond(req, res, { origin: `http://${bind}:${actualPort}`, port: actualPort, token, store, cardWorker, agent, chatFiles });
   });
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -432,15 +610,20 @@ export async function startWriterServer({ port = 4317, directory = defaultDirect
     });
   });
   const origin = `http://${bind}:${server.address().port}`;
-  const check = () => dueForAll(store).catch(error => console.error('Memory scheduler:', error.code || error.name));
-  const scheduler = setInterval(check, 60_000);
+  const check = () => dueForAll(store)
+    .then(() => cardWorker.wake())
+    .catch(error => console.error('Memory scheduler:', error.code || error.name));
+  const scheduler = setInterval(() => { agent.prune(); void check(); }, 60_000);
   scheduler.unref();
   void check();
   return {
     origin,
-    close() {
+    async close() {
       clearInterval(scheduler);
-      return new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      await Promise.all([
+        cardWorker.close(),
+        new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())),
+      ]);
     },
   };
 }

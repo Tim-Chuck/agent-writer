@@ -125,3 +125,33 @@ test('keeps the local dialogue in view and labels earlier answers as drafts', ()
   assert.match(result.prompt, /助手草稿：第二个是把信藏在车站/);
   assert.doesNotMatch(result.prompt, /意外指令/);
 });
+
+test('recalls an early passage from a long book while excluding later revelations', () => {
+  const book = project();
+  const first = { id: 'clue', title: '第十二章 交接', text: `${'平静的夜晚。\n'.repeat(260)}周远接过铜钥匙，林岚转身离开。\n${'几天过去。\n'.repeat(260)}` };
+  book.chapters = [first, ...Array.from({ length: 67 }, (_, i) => ({ id: `middle-${i}`,
+    title: `第 ${i + 13} 章`, text: '海浪拍岸。\n'.repeat(700) })),
+  { id: 'here', title: '第八十章', text: '烛火在窗边晃动。' },
+  { id: 'later', title: '第八十一章', text: '周远把铜钥匙熔化。这个秘密明天才揭晓。' }];
+  const time = performance.now();
+  const context = buildContext(book, { chapterId: 'here', selected: { chapters: true }, prompt: '核对「铜钥匙」转手时周远的行为' });
+  assert.match(context.prompt, /周远接过铜钥匙，林岚转身离开。/);
+  assert.ok(context.report.recalled.some(item => item.id === 'clue' && item.offset > 0));
+  assert.doesNotMatch(context.prompt, /铜钥匙熔化|明天才揭晓/);
+  assert.ok(context.report.characters < 25_000, `${context.report.characters} characters in ${performance.now() - time} ms`);
+});
+
+test('gives explicitly selected sources fuller coverage in deep reading and reserves output tokens', () => {
+  const book = project();
+  book.chapters[0].text = '长夜。'.repeat(10000) + '末尾的约定。';
+  book.chapters.push({ id: 'active', title: '本章', text: '现在开始。' });
+  const options = { chapterId: 'active', selected: { chapters: ['one'] }, prompt: '检查前文' };
+  const standard = buildContext(book, options);
+  const deep = buildContext(book, { ...options, depth: 'deep', contextTokens: 200_000 });
+  assert.equal(standard.report.focused.find(entry => entry.id === 'one').coverage, 'excerpt');
+  assert.equal(deep.report.focused.find(entry => entry.id === 'one').coverage, 'full');
+  assert.equal(deep.outputTokens, 8192);
+  const smaller = buildContext(book, { ...options, depth: 'deep', contextTokens: 4096 });
+  assert.equal(smaller.outputTokens, 1024);
+  assert.ok(smaller.report.characters < 2500);
+});
